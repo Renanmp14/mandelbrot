@@ -7,11 +7,22 @@
  *  Main thread  →  Produz tarefas (blocos da tela) e renderiza
  *  Worker threads → Consomem tarefas e calculam os pixels
  *
- * Uso:
- *   ./mandelbrot <num_threads> <max_iter> <block_size>
+ * Uso (todos os parâmetros têm valores padrão):
+ *   ./mandelbrot [--threads N] [--max-iter N] [--block-size N]
+ *               [--width N] [--height N]
+ *               [--zoom-x F] [--zoom-y F]
+ *               [--zoom-factor F] [--frame-delay N]
+ *               [--palette N]
+ *
+ * Paletas disponíveis:
+ *   0 = Padrão (azul/verde/roxo)
+ *   1 = Fogo   (vermelho/laranja/amarelo)
+ *   2 = Oceano (azul profundo)
+ *   3 = Gold & Purple (arco-íris)
+ *   4 = Escala de Cinza
  *
  * Exemplo:
- *   ./mandelbrot 4 256 32
+ *   ./mandelbrot --threads 8 --max-iter 256 --block-size 16 --palette 1
  */
 
 #include <SDL2/SDL.h>
@@ -23,45 +34,34 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <cstdint>
 #include <algorithm>
+#include <string>
 
 // ════════════════════════════════════════════════════════════
-//  CONFIGURAÇÕES GLOBAIS
+//  PARSING DE ARGUMENTOS
 // ════════════════════════════════════════════════════════════
 
-static const int    WIN_W          = 900;
-static const int    WIN_H          = 900;
+static const char* get_arg(int argc, char** argv, const char* key)
+{
+    for (int i = 1; i < argc - 1; i++) {
+        if (std::strcmp(argv[i], key) == 0) return argv[i + 1];
+    }
+    return nullptr;
+}
 
-// Ponto alvo do zoom: ponta de uma espiral no Seahorse Valley.
-// Este ponto fica exatamente na FRONTEIRA do conjunto de Mandelbrot,
-// garantindo estrutura fractal visível em qualquer nível de zoom.
-// (O ponto anterior -0.7269/0.1889 ficava levemente dentro de um "lago"
-//  interno do conjunto, fazendo a tela ficar totalmente preta em zoom profundo.)
-static const double ZOOM_TARGET_X  = -0.7436438885706799;
-static const double ZOOM_TARGET_Y  =  0.1318259042053185;
+static int    arg_int(int argc, char** argv, const char* key, int    def)
+{
+    const char* v = get_arg(argc, argv, key);
+    return v ? std::atoi(v) : def;
+}
 
-// Escala inicial: enquadra o conjunto de Mandelbrot inteiro na tela (~3.5 unidades)
-static const double SCALE_INITIAL  = 3.5 / WIN_W;
-
-// Fator de zoom por frame — deve ser MAIOR que 1.0 para aproximar a câmera.
-// Quanto mais próximo de 1.0, mais lento e suave o zoom.
-//   1.005 = +0.5%/frame → muito lento, cinematográfico
-//   1.008 = +0.8%/frame → lento e suave       ← atual
-//   1.015 = +1.5%/frame → moderado
-//   1.018 = +1.8%/frame → rápido (original)
-static const double ZOOM_FACTOR    = 1.008;
-
-// Limite de precisão do double (~15 dígitos); abaixo disso reinicia o zoom
-static const double SCALE_MIN      = 1e-13;
-
-// Intervalo mínimo entre frames em milissegundos (0 = renderiza o mais rápido possível)
-// Aumentar esse valor reduz a frequência de novos renders, aliviando o CPU.
-//   0   ms → sem limite, máxima velocidade
-//   16  ms → ~60 FPS
-//   33  ms → ~30 FPS
-//   100 ms → ~10 FPS
-static const Uint32 FRAME_DELAY_MS = 0;
+static double arg_dbl(int argc, char** argv, const char* key, double def)
+{
+    const char* v = get_arg(argc, argv, key);
+    return v ? std::atof(v) : def;
+}
 
 // ════════════════════════════════════════════════════════════
 //  ESTRUTURAS DE DADOS
@@ -69,7 +69,6 @@ static const Uint32 FRAME_DELAY_MS = 0;
 
 /**
  * Task: descreve um bloco retangular de pixels a ser calculado.
- * A tela inteira é dividida em N tarefas pelo produtor (main thread).
  */
 struct Task {
     int x0, y0;   // canto superior esquerdo, inclusivo
@@ -78,45 +77,41 @@ struct Task {
 
 /**
  * ViewState: captura os parâmetros de visão de um frame específico.
- * As workers fazem uma cópia local para evitar leitura de estado em transição.
+ * Workers fazem cópia local para evitar leitura de estado em transição.
  */
 struct ViewState {
-    double cx, cy;   // centro da visão no plano complexo
-    double scale;    // unidades complexas por pixel (menor = mais zoom)
-    int    max_iter; // máximo de iterações do algoritmo de Mandelbrot
+    double cx, cy;    // centro no plano complexo
+    double scale;     // unidades complexas por pixel (menor = mais zoom)
+    int    max_iter;  // máximo de iterações
+    int    palette;   // paleta de cores (0–4)
 };
 
 /**
- * SharedCtx: contexto compartilhado entre a main thread e todas as workers.
- *
- * Sincronização:
- *  • task_mutex + task_cond   → protegem a fila de tarefas
- *  • done_mutex + done_cond   → sinalizam conclusão do frame à main thread
- *  • tasks_remaining (atomic) → contador de tarefas pendentes no frame atual
- *  • pixels (sem mutex)       → cada Task cobre pixels disjuntos, sem conflito
+ * SharedCtx: contexto compartilhado entre main e workers.
  */
 struct SharedCtx {
 
+    // ── Dimensões da janela ────────────────────────────────
+    int win_w, win_h;
+
     // ── Fila de tarefas (produtor/consumidor) ──────────────
-    std::queue<Task>  task_queue;
-    pthread_mutex_t   task_mutex;   // protege task_queue
-    pthread_cond_t    task_cond;    // acorda workers quando há tarefas
+    std::queue<Task> task_queue;
+    pthread_mutex_t  task_mutex;
+    pthread_cond_t   task_cond;
 
     // ── Buffer de resultado ────────────────────────────────
-    // Formato ARGB: 0xAARRGGBB — tamanho WIN_W × WIN_H pixels
-    uint32_t* pixels;
+    uint32_t* pixels;   // formato ARGB: 0xAARRGGBB, tamanho win_w × win_h
 
     // ── Estado de visão atual ──────────────────────────────
-    // Escrito apenas pela main thread (após wait_frame_done); lido pelas workers
     ViewState view;
 
     // ── Conclusão de frame ─────────────────────────────────
-    std::atomic<int>  tasks_remaining;  // decrementado por cada worker ao terminar
-    pthread_mutex_t   done_mutex;
-    pthread_cond_t    done_cond;        // sinalizado quando tasks_remaining == 0
+    std::atomic<int> tasks_remaining;
+    pthread_mutex_t  done_mutex;
+    pthread_cond_t   done_cond;
 
     // ── Encerramento ───────────────────────────────────────
-    bool shutdown;                      // protegido por task_mutex
+    bool shutdown;
 };
 
 // ════════════════════════════════════════════════════════════
@@ -126,32 +121,14 @@ struct SharedCtx {
 /**
  * Calcula a cor ARGB do ponto (px, py) no plano complexo.
  *
- * Otimizações aplicadas (em ordem de execução):
- *
- *  1. Verificação de cardioide e bulbo de período 2
- *     O conjunto de Mandelbrot tem dois corpos principais que cobrem a maior
- *     parte da área visível em zoom inicial. Verificar se o ponto está dentro
- *     deles é O(1) e evita o loop inteiro para esses pixels.
- *
- *  2. Detecção de período — algoritmo de Brent
- *     Pontos no interior do conjunto ficam presos em órbitas periódicas
- *     (o valor de z começa a se repetir). Sem essa verificação, o loop roda
- *     até max_iter mesmo para pixels totalmente interiores.
- *     Estratégia: a cada 'check_at' iterações, compara z atual com o z
- *     salvo no último checkpoint. Se forem iguais (dentro de epsilon), a
- *     órbita é periódica → ponto interior → retorna preto imediatamente.
- *     O intervalo dobra exponencialmente (4 → 8 → 16 → ... → 512) para
- *     cobrir períodos longos sem verificar a cada iteração.
- *
- *  3. Smooth coloring (apenas para pontos externos)
- *     Usa o módulo final de z para interpolar entre iterações, eliminando
- *     as faixas bruscas de cor na fronteira do conjunto.
+ * Otimizações:
+ *  1. Verificação de cardioide e bulbo de período 2 — O(1)
+ *  2. Detecção de período (algoritmo de Brent) — saída antecipada para interiores
+ *  3. Smooth coloring — elimina faixas bruscas de cor
  */
-static uint32_t compute_pixel(double px, double py, int max_iter)
+static uint32_t compute_pixel(double px, double py, int max_iter, int palette)
 {
     // ── Otimização 1: cardioide principal e bulbo de período 2 ───────────
-    // Fórmula exata para o interior da cardioide: q*(q + Re(c) - 0.25) < Im(c)²/4
-    // Fórmula exata para o bulbo de período 2:   |c + 1|² < 0.0625
     {
         double q = (px - 0.25) * (px - 0.25) + py * py;
         if (q * (q + px - 0.25) < 0.25 * py * py) return 0xFF000000;
@@ -162,9 +139,8 @@ static uint32_t compute_pixel(double px, double py, int max_iter)
     int    iter = 0;
 
     // ── Otimização 2: detecção de período (Brent) ────────────────────────
-    double xold = 0.0, yold = 0.0;   // último ponto de referência salvo
-    int    check_at    = 4;           // intervalo atual de verificação
-    int    since_check = 0;           // iterações desde o último checkpoint
+    double xold = 0.0, yold = 0.0;
+    int    check_at = 4, since_check = 0;
 
     while (iter < max_iter && zr2 + zi2 <= 4.0) {
         zi  = 2.0 * zr * zi + py;
@@ -173,35 +149,56 @@ static uint32_t compute_pixel(double px, double py, int max_iter)
         zi2 = zi * zi;
         iter++;
 
-        // Compara z atual com o ponto de referência salvo
         if (std::abs(zr - xold) < 1e-10 && std::abs(zi - yold) < 1e-10)
-            return 0xFF000000;  // órbita cíclica → interior do conjunto
+            return 0xFF000000;
 
-        // Atualiza checkpoint e dobra o intervalo (até 512)
         if (++since_check == check_at) {
-            xold       = zr;
-            yold       = zi;
+            xold = zr; yold = zi;
             since_check = 0;
             if (check_at < 512) check_at *= 2;
         }
     }
 
-    // Interior do conjunto (esgotou iterações sem escapar) → preto
     if (iter == max_iter) return 0xFF000000;
 
     // ── Smooth coloring ──────────────────────────────────────────────────
-    // log_zn  = log(|z|)
-    // nu      = log₂(log₂(|z|)) — normalização logarítmica dupla
-    // smooth  = valor contínuo que elimina bandas bruscas de cor
     double log_zn = std::log(zr2 + zi2) * 0.5;
     double nu     = std::log(log_zn / std::log(2.0)) / std::log(2.0);
     double smooth = (double)(iter + 1) - nu;
+    double t      = smooth / (double)max_iter;
 
-    // Paleta via funções seno com 3 canais defasados em 120°
-    double t = smooth / (double)max_iter;
-    double r = 0.5 + 0.5 * std::sin(6.28318 * (t * 3.0 + 0.00));
-    double g = 0.5 + 0.5 * std::sin(6.28318 * (t * 3.0 + 0.33));
-    double b = 0.5 + 0.5 * std::sin(6.28318 * (t * 3.0 + 0.67));
+    double r, g, b;
+
+    switch (palette) {
+
+        case 1: // Fogo — vermelho → laranja → amarelo
+            r = std::min(1.0, t * 3.0);
+            g = std::min(1.0, std::max(0.0, t * 3.0 - 1.0));
+            b = std::min(1.0, std::max(0.0, t * 3.0 - 2.0));
+            break;
+
+        case 2: // Oceano — azul profundo → ciano
+            r = std::min(1.0, std::max(0.0, t * 3.0 - 2.0));
+            g = std::min(1.0, std::max(0.0, t * 3.0 - 1.0));
+            b = std::min(1.0, t * 3.0);
+            break;
+
+        case 3: // Gold & Purple — ciclo de arco-íris dourado/roxo
+            r = 0.5 + 0.5 * std::sin(6.28318 * (t * 2.0 + 0.75));
+            g = 0.5 + 0.5 * std::sin(6.28318 * (t * 2.0 + 0.50));
+            b = 0.5 + 0.5 * std::sin(6.28318 * (t * 2.0 + 0.00));
+            break;
+
+        case 4: // Escala de cinza
+            r = t; g = t; b = t;
+            break;
+
+        default: // Padrão — azul/verde/roxo (canais defasados 120°)
+            r = 0.5 + 0.5 * std::sin(6.28318 * (t * 3.0 + 0.00));
+            g = 0.5 + 0.5 * std::sin(6.28318 * (t * 3.0 + 0.33));
+            b = 0.5 + 0.5 * std::sin(6.28318 * (t * 3.0 + 0.67));
+            break;
+    }
 
     return 0xFF000000
          | ((uint32_t)(r * 255.0) << 16)
@@ -210,31 +207,19 @@ static uint32_t compute_pixel(double px, double py, int max_iter)
 }
 
 // ════════════════════════════════════════════════════════════
-//  FUNÇÃO DA THREAD TRABALHADORA (WORKER)
+//  THREAD TRABALHADORA (WORKER)
 // ════════════════════════════════════════════════════════════
 
-/**
- * Loop executado por cada worker thread:
- *   1. Aguarda tarefa na fila (condition variable)
- *   2. Retira a tarefa
- *   3. Calcula todos os pixels do bloco
- *   4. Decrementa tasks_remaining; se chegou a 0, acorda a main thread
- */
 static void* worker_func(void* arg)
 {
     SharedCtx* ctx = static_cast<SharedCtx*>(arg);
 
     while (true) {
 
-        // ── 1. Aguarda e retira uma tarefa da fila ────────────
         pthread_mutex_lock(&ctx->task_mutex);
-
-        // Espera enquanto a fila está vazia e não foi pedido encerramento
-        while (ctx->task_queue.empty() && !ctx->shutdown) {
+        while (ctx->task_queue.empty() && !ctx->shutdown)
             pthread_cond_wait(&ctx->task_cond, &ctx->task_mutex);
-        }
 
-        // Encerramento solicitado sem tarefas pendentes → sai
         if (ctx->task_queue.empty()) {
             pthread_mutex_unlock(&ctx->task_mutex);
             break;
@@ -244,27 +229,19 @@ static void* worker_func(void* arg)
         ctx->task_queue.pop();
         pthread_mutex_unlock(&ctx->task_mutex);
 
-        // ── 2. Captura estado de visão (cópia local) ──────────
-        // Seguro: a main thread não altera ctx->view enquanto há tasks ativas
-        ViewState v = ctx->view;
+        ViewState v = ctx->view;   // cópia local — seguro contra data race
 
-        // ── 3. Calcula os pixels do bloco ──────────────────────
+        const int W = ctx->win_w;
+        const int H = ctx->win_h;
+
         for (int py = task.y0; py < task.y1; py++) {
             for (int px = task.x0; px < task.x1; px++) {
-
-                // Converte coordenada de pixel → plano complexo
-                // O centro da tela corresponde a (v.cx, v.cy)
-                double cx = v.cx + (px - WIN_W * 0.5) * v.scale;
-                double cy = v.cy + (py - WIN_H * 0.5) * v.scale;
-
-                // Grava resultado diretamente no buffer — sem mutex pois
-                // cada task cobre uma região exclusiva da imagem
-                ctx->pixels[py * WIN_W + px] = compute_pixel(cx, cy, v.max_iter);
+                double cx = v.cx + (px - W * 0.5) * v.scale;
+                double cy = v.cy + (py - H * 0.5) * v.scale;
+                ctx->pixels[py * W + px] = compute_pixel(cx, cy, v.max_iter, v.palette);
             }
         }
 
-        // ── 4. Sinaliza conclusão da tarefa ───────────────────
-        // Decremento atômico; se chegou a zero, este era o último bloco do frame
         if (--ctx->tasks_remaining == 0) {
             pthread_mutex_lock(&ctx->done_mutex);
             pthread_cond_signal(&ctx->done_cond);
@@ -276,54 +253,36 @@ static void* worker_func(void* arg)
 }
 
 // ════════════════════════════════════════════════════════════
-//  PRODUÇÃO E ESPERA DE FRAME (CHAMADAS DA MAIN THREAD)
+//  PRODUÇÃO E ESPERA DE FRAME
 // ════════════════════════════════════════════════════════════
 
-/**
- * Divide a tela em blocos de block_size×block_size pixels e enfileira
- * as tarefas. Deve ser chamado APÓS atualizar ctx->view.
- *
- * Define tasks_remaining ANTES de enfileirar, garantindo que o
- * contador já está correto mesmo que uma worker processe muito rápido.
- */
 static void dispatch_frame(SharedCtx* ctx, int block_size)
 {
+    const int W = ctx->win_w;
+    const int H = ctx->win_h;
+
     std::vector<Task> tasks;
-    tasks.reserve((WIN_W / block_size + 1) * (WIN_H / block_size + 1));
+    tasks.reserve((W / block_size + 1) * (H / block_size + 1));
 
-    for (int y = 0; y < WIN_H; y += block_size) {
-        for (int x = 0; x < WIN_W; x += block_size) {
-            tasks.push_back({
-                x,
-                y,
-                std::min(x + block_size, WIN_W),
-                std::min(y + block_size, WIN_H)
-            });
-        }
-    }
+    for (int y = 0; y < H; y += block_size)
+        for (int x = 0; x < W; x += block_size)
+            tasks.push_back({ x, y,
+                              std::min(x + block_size, W),
+                              std::min(y + block_size, H) });
 
-    // Registra quantas tarefas devem ser concluídas ANTES de enfileirar
     ctx->tasks_remaining.store((int)tasks.size());
 
     pthread_mutex_lock(&ctx->task_mutex);
     for (const Task& t : tasks) ctx->task_queue.push(t);
-    pthread_cond_broadcast(&ctx->task_cond);   // acorda todas as workers em espera
+    pthread_cond_broadcast(&ctx->task_cond);
     pthread_mutex_unlock(&ctx->task_mutex);
 }
 
-/**
- * Bloqueia a main thread até que todas as tarefas do frame sejam concluídas.
- *
- * Uso de done_mutex garante ausência de "lost wakeup":
- *   Se a última task terminar ANTES de entrarmos no cond_wait,
- *   a checagem tasks_remaining > 0 já será falsa e não esperamos.
- */
 static void wait_frame_done(SharedCtx* ctx)
 {
     pthread_mutex_lock(&ctx->done_mutex);
-    while (ctx->tasks_remaining.load() > 0) {
+    while (ctx->tasks_remaining.load() > 0)
         pthread_cond_wait(&ctx->done_cond, &ctx->done_mutex);
-    }
     pthread_mutex_unlock(&ctx->done_mutex);
 }
 
@@ -333,45 +292,57 @@ static void wait_frame_done(SharedCtx* ctx)
 
 int main(int argc, char* argv[])
 {
-    // ── Parâmetros via linha de comando ───────────────────────
-    int num_threads = (argc >= 2) ? std::atoi(argv[1]) : 4;
-    int max_iter    = (argc >= 3) ? std::atoi(argv[2]) : 256;
-    int block_size  = (argc >= 4) ? std::atoi(argv[3]) : 32;
+    // ── Lê todos os parâmetros (com valores padrão) ───────────
+    const int    num_threads  = std::max(1,  arg_int(argc, argv, "--threads",    4));
+    const int    max_iter     = std::max(16, arg_int(argc, argv, "--max-iter",   256));
+    const int    block_size   = std::max(4,  arg_int(argc, argv, "--block-size", 32));
+    const int    win_w        = std::max(200,arg_int(argc, argv, "--width",      900));
+    const int    win_h        = std::max(200,arg_int(argc, argv, "--height",     900));
+    const double zoom_x       = arg_dbl(argc, argv, "--zoom-x",      -0.7436438885706799);
+    const double zoom_y       = arg_dbl(argc, argv, "--zoom-y",       0.1318259042053185);
+    const double zoom_factor  = std::max(1.0001, arg_dbl(argc, argv, "--zoom-factor",  1.008));
+    const int    frame_delay  = std::max(0,  arg_int(argc, argv, "--frame-delay", 0));
+    const int    palette      = arg_int(argc, argv, "--palette", 0);
 
-    if (num_threads < 1) num_threads = 1;
-    if (max_iter    < 16) max_iter   = 16;
-    if (block_size  < 4)  block_size = 4;
+    const double scale_initial = 3.5 / win_w;
+    const double scale_min     = 1e-13;
 
-    printf("╔══ Mandelbrot ══════════════════════════════╗\n");
-    printf("║  threads   = %d\n", num_threads);
-    printf("║  max_iter  = %d\n", max_iter);
-    printf("║  block_size= %d×%d px\n", block_size, block_size);
-    printf("║  janela    = %d×%d px\n", WIN_W, WIN_H);
-    printf("╚════════════════════════════════════════════╝\n");
+    // ── Banner de inicialização ───────────────────────────────
+    printf("╔══ Mandelbrot ═════════════════════════════════════╗\n");
+    printf("║  threads     = %d\n", num_threads);
+    printf("║  max_iter    = %d\n", max_iter);
+    printf("║  block_size  = %d×%d px\n", block_size, block_size);
+    printf("║  janela      = %d×%d px\n", win_w, win_h);
+    printf("║  zoom_target = (%.6f, %.6f)\n", zoom_x, zoom_y);
+    printf("║  zoom_factor = %.4f\n", zoom_factor);
+    printf("║  frame_delay = %d ms\n", frame_delay);
+    printf("║  palette     = %d\n", palette);
+    printf("╚═══════════════════════════════════════════════════╝\n");
     printf("Pressione ESC ou feche a janela para sair.\n\n");
 
-    // ── Inicializa o contexto compartilhado ───────────────────
+    // ── Contexto compartilhado ────────────────────────────────
     SharedCtx ctx;
     ctx.shutdown = false;
     ctx.tasks_remaining.store(0);
-    ctx.pixels = new uint32_t[WIN_W * WIN_H];
+    ctx.win_w  = win_w;
+    ctx.win_h  = win_h;
+    ctx.pixels = new uint32_t[win_w * win_h];
 
     pthread_mutex_init(&ctx.task_mutex, nullptr);
     pthread_cond_init (&ctx.task_cond,  nullptr);
     pthread_mutex_init(&ctx.done_mutex, nullptr);
     pthread_cond_init (&ctx.done_cond,  nullptr);
 
-    // Estado de visão inicial: centro apontado para o alvo, campo aberto
-    ctx.view = { ZOOM_TARGET_X, ZOOM_TARGET_Y, SCALE_INITIAL, max_iter };
+    ctx.view = { zoom_x, zoom_y, scale_initial, max_iter, palette };
 
-    // ── Cria o pool de threads trabalhadoras ──────────────────
+    // ── Pool de workers ───────────────────────────────────────
     std::vector<pthread_t> workers(num_threads);
     for (int i = 0; i < num_threads; i++) {
         pthread_create(&workers[i], nullptr, worker_func, &ctx);
         printf("  Worker thread %d criada.\n", i);
     }
 
-    // ── Inicializa SDL2 ───────────────────────────────────────
+    // ── SDL2 ──────────────────────────────────────────────────
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "SDL_Init falhou: %s\n", SDL_GetError());
         return 1;
@@ -380,116 +351,90 @@ int main(int argc, char* argv[])
     SDL_Window* window = SDL_CreateWindow(
         "Mandelbrot — Computação de Alto Desempenho",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        WIN_W, WIN_H, 0
+        win_w, win_h, 0
     );
-    if (!window) {
-        fprintf(stderr, "SDL_CreateWindow falhou: %s\n", SDL_GetError());
-        return 1;
-    }
+    if (!window) { fprintf(stderr, "SDL_CreateWindow falhou: %s\n", SDL_GetError()); return 1; }
 
     SDL_Renderer* renderer = SDL_CreateRenderer(
         window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC
     );
-    if (!renderer) {
-        fprintf(stderr, "SDL_CreateRenderer falhou: %s\n", SDL_GetError());
-        return 1;
-    }
+    if (!renderer) { fprintf(stderr, "SDL_CreateRenderer falhou: %s\n", SDL_GetError()); return 1; }
 
-    // Textura de streaming: atualizamos a cada frame com nosso buffer de pixels
     SDL_Texture* texture = SDL_CreateTexture(
-        renderer,
-        SDL_PIXELFORMAT_ARGB8888,       // formato: 0xAARRGGBB (compatível com nosso buffer)
-        SDL_TEXTUREACCESS_STREAMING,
-        WIN_W, WIN_H
+        renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, win_w, win_h
     );
 
-    // ── Loop principal de renderização ────────────────────────
+    // ── Loop de renderização ──────────────────────────────────
     bool     running    = true;
     uint64_t frame_no   = 0;
     uint64_t fps_frames = 0;
     Uint32   fps_t0     = SDL_GetTicks();
+    Uint32   last_frame_ts = 0;
 
     while (running) {
 
-        // ─── Fase de computação com renderização progressiva ─────
-        // Enfileira os blocos e atualiza a tela enquanto os workers calculam.
-        // Assim é possível VER cada bloco sendo preenchido conforme as threads
-        // terminam — em vez de esperar tudo pronto para mostrar de uma vez.
+        // Renderização progressiva: atualiza tela enquanto workers calculam
         dispatch_frame(&ctx, block_size);
 
         while (ctx.tasks_remaining.load() > 0) {
-            // Processa eventos mesmo durante o cálculo (janela continua responsiva)
             SDL_Event ev;
             while (SDL_PollEvent(&ev)) {
                 if (ev.type == SDL_QUIT) running = false;
-                if (ev.type == SDL_KEYDOWN &&
-                    ev.key.keysym.sym == SDLK_ESCAPE) running = false;
+                if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_ESCAPE) running = false;
             }
             if (!running) break;
 
-            // Exibe o estado parcial: blocos prontos aparecem, os outros mostram
-            // o frame anterior enquanto aguardam ser calculados
-            SDL_UpdateTexture(texture, nullptr, ctx.pixels, WIN_W * sizeof(uint32_t));
+            SDL_UpdateTexture(texture, nullptr, ctx.pixels, win_w * sizeof(uint32_t));
             SDL_RenderClear(renderer);
             SDL_RenderCopy(renderer, texture, nullptr, nullptr);
             SDL_RenderPresent(renderer);
         }
 
-        // Aguarda conclusão total antes de avançar o zoom
         wait_frame_done(&ctx);
         if (!running) break;
 
-        // Exibe o frame completo final
-        SDL_UpdateTexture(texture, nullptr, ctx.pixels, WIN_W * sizeof(uint32_t));
+        SDL_UpdateTexture(texture, nullptr, ctx.pixels, win_w * sizeof(uint32_t));
         SDL_RenderClear(renderer);
         SDL_RenderCopy(renderer, texture, nullptr, nullptr);
         SDL_RenderPresent(renderer);
 
-        // ─── Throttle de frame ────────────────────────────────
-        // Garante que o loop não rode mais rápido que FRAME_DELAY_MS por frame.
-        // Se o cálculo já levou mais que o delay, não espera nada.
-        if (FRAME_DELAY_MS > 0) {
-            static Uint32 last_frame = 0;
-            Uint32 elapsed = SDL_GetTicks() - last_frame;
-            if (elapsed < FRAME_DELAY_MS)
-                SDL_Delay(FRAME_DELAY_MS - elapsed);
-            last_frame = SDL_GetTicks();
+        // Throttle de frame
+        if (frame_delay > 0) {
+            Uint32 elapsed = SDL_GetTicks() - last_frame_ts;
+            if (elapsed < (Uint32)frame_delay)
+                SDL_Delay((Uint32)frame_delay - elapsed);
+            last_frame_ts = SDL_GetTicks();
         }
 
-        // ─── Avança o zoom ────────────────────────────────────
-        // Divide a escala (menos unidades/pixel = mais zoom)
-        ctx.view.scale /= ZOOM_FACTOR;
+        // Avança zoom
+        ctx.view.scale /= zoom_factor;
         frame_no++;
 
-        // max_iter dinâmico: cresce com o zoom para manter detalhe na fronteira.
-        // Usa raiz quadrada do log para crescer bem mais devagar em zoom extremo:
-        //   zoom 10×    → base + ~11   iters
-        //   zoom 1000×  → base + ~50   iters
-        //   zoom 10⁶×   → base + ~100  iters   (vs ~299 com a fórmula anterior)
-        // O cap em 4× o base garante que nunca explode independente do zoom.
-        double zoom_depth = SCALE_INITIAL / ctx.view.scale;
-        double growth     = 16.0 * std::sqrt(std::log2(1.0 + zoom_depth));
-        ctx.view.max_iter = max_iter + (int)growth;
-        ctx.view.max_iter = std::min(ctx.view.max_iter, max_iter * 4); // cap em 4×
+        // max_iter dinâmico (cresce com zoom, sem explodir)
+        double zoom_depth     = scale_initial / ctx.view.scale;
+        double growth         = 16.0 * std::sqrt(std::log2(1.0 + zoom_depth));
+        ctx.view.max_iter     = max_iter + (int)growth;
+        ctx.view.max_iter     = std::min(ctx.view.max_iter, max_iter * 4);
 
-        // Reinicia quando o double não tem mais precisão suficiente
-        if (ctx.view.scale < SCALE_MIN) {
-            printf("Limite de precisão atingido. Reiniciando zoom (frame %llu).\n",
+        // Reinicia ao atingir limite de precisão do double
+        if (ctx.view.scale < scale_min) {
+            printf("Limite de precisão atingido. Reiniciando (frame %llu).\n",
                    (unsigned long long)frame_no);
-            ctx.view.scale    = SCALE_INITIAL;
-            ctx.view.max_iter = max_iter; // volta ao max_iter base
+            ctx.view.scale    = scale_initial;
+            ctx.view.max_iter = max_iter;
             frame_no = 0;
         }
 
-        // ─── Atualiza título com FPS e zoom ───────────────────
+        // Atualiza título com FPS e nível de zoom
         fps_frames++;
         Uint32 now = SDL_GetTicks();
         if (now - fps_t0 >= 1000) {
-            double zoom = SCALE_INITIAL / ctx.view.scale;
-            char title[128];
+            double zoom = scale_initial / ctx.view.scale;
+            char title[160];
             snprintf(title, sizeof(title),
-                     "Mandelbrot | FPS: %llu | Zoom: %.2e×  [threads=%d]",
-                     (unsigned long long)fps_frames, zoom, num_threads);
+                     "Mandelbrot | FPS: %llu | Zoom: %.2e×  [threads=%d  iter=%d  paleta=%d]",
+                     (unsigned long long)fps_frames, zoom, num_threads,
+                     ctx.view.max_iter, palette);
             SDL_SetWindowTitle(window, title);
             fps_frames = 0;
             fps_t0 = now;
@@ -497,23 +442,19 @@ int main(int argc, char* argv[])
     }
 
     // ── Encerramento limpo ────────────────────────────────────
-    // Ativa flag de shutdown e acorda todas as workers para que saiam do loop
     pthread_mutex_lock(&ctx.task_mutex);
     ctx.shutdown = true;
     pthread_cond_broadcast(&ctx.task_cond);
     pthread_mutex_unlock(&ctx.task_mutex);
 
     for (pthread_t& t : workers) pthread_join(t, nullptr);
-    printf("Todas as threads encerradas. Total de frames: %llu\n",
-           (unsigned long long)frame_no);
+    printf("Threads encerradas. Total de frames: %llu\n", (unsigned long long)frame_no);
 
-    // Libera recursos SDL
     SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_Quit();
 
-    // Libera primitivos e memória
     pthread_mutex_destroy(&ctx.task_mutex);
     pthread_cond_destroy (&ctx.task_cond);
     pthread_mutex_destroy(&ctx.done_mutex);

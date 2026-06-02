@@ -7,20 +7,31 @@ Renderizador interativo do fractal de Mandelbrot com **zoom contínuo e automát
 ## Sumário
 
 1. [Pré-requisitos](#pré-requisitos)
-2. [Como compilar](#como-compilar)
-3. [Como executar](#como-executar)
-4. [Parâmetros e seu efeito na renderização](#parâmetros-e-seu-efeito-na-renderização)
-5. [Bibliotecas utilizadas](#bibliotecas-utilizadas)
-6. [Arquivos do projeto](#arquivos-do-projeto)
-7. [Explicação do código](#explicação-do-código)
+2. [Interface Gráfica — launcher.py](#interface-gráfica--launcherppy)
+   - [Como executar o launcher](#como-executar-o-launcher)
+   - [Ambiente de execução](#ambiente-de-execução)
+   - [Seção Desempenho](#seção-desempenho)
+   - [Seção Janela](#seção-janela)
+   - [Seção Paleta de Cores](#seção-paleta-de-cores)
+   - [Seção Ponto Alvo do Zoom](#seção-ponto-alvo-do-zoom)
+   - [Seção Velocidade do Zoom](#seção-velocidade-do-zoom)
+   - [Seção Delay Entre Frames](#seção-delay-entre-frames)
+   - [Preview do Comando](#preview-do-comando)
+   - [Botões e indicadores](#botões-e-indicadores)
+3. [Como compilar](#como-compilar)
+4. [Como executar](#como-executar)
+5. [Parâmetros e seu efeito na renderização](#parâmetros-e-seu-efeito-na-renderização)
+6. [Bibliotecas utilizadas](#bibliotecas-utilizadas)
+7. [Arquivos do projeto](#arquivos-do-projeto)
+8. [Explicação do código](#explicação-do-código)
    - [Estruturas de dados](#estruturas-de-dados)
    - [Algoritmo de Mandelbrot e coloração](#algoritmo-de-mandelbrot-e-coloração)
    - [Thread trabalhadora (worker)](#thread-trabalhadora-worker)
    - [Produção de tarefas e espera de frame](#produção-de-tarefas-e-espera-de-frame)
    - [Função `main`](#função-main)
-8. [Arquitetura e sincronização](#arquitetura-e-sincronização)
-9. [Personalizando a imagem (onde alterar no código)](#personalizando-a-imagem-onde-alterar-no-código)
-10. [Testes de balanceamento e performance](#testes-de-balanceamento-e-performance)
+9. [Arquitetura e sincronização](#arquitetura-e-sincronização)
+10. [Personalizando a imagem (onde alterar no código)](#personalizando-a-imagem-onde-alterar-no-código)
+11. [Testes de balanceamento e performance](#testes-de-balanceamento-e-performance)
 
 ---
 
@@ -54,6 +65,214 @@ sudo apt-get install -y g++ libsdl2-dev make
 ### Requisito de display (WSL2 no Windows)
 
 Para abrir a janela gráfica a partir do WSL2, o Windows precisa suportar **WSLg** (disponível no Windows 11 com WSL 2.0+) ou ter um servidor X instalado (ex.: VcXsrv). No Windows 11 atualizado, a janela abre automaticamente sem configuração extra.
+
+---
+
+## Interface Gráfica — launcher.py
+
+O projeto inclui um **launcher** em Python/Tkinter que permite configurar todos os parâmetros visualmente, compilar e executar o programa sem abrir um terminal. É a forma recomendada de uso, especialmente para quem não está familiarizado com a linha de comando.
+
+```
+mandelbrot/
+└── launcher.py   ← execute este arquivo com Python no Windows
+```
+
+---
+
+### Como executar o launcher
+
+**Pré-requisito:** Python 3.8+ instalado no Windows (o Tkinter já vem incluso).
+
+```powershell
+# No PowerShell, dentro da pasta do projeto:
+python launcher.py
+```
+
+Ou dê dois cliques em `launcher.py` no Explorador de Arquivos se o Python estiver configurado como aplicativo padrão para `.py`.
+
+---
+
+### Ambiente de execução
+
+O card **AMBIENTE DE EXECUÇÃO**, exibido logo abaixo do cabeçalho, define *como* o programa será compilado e executado. Ele tem dois modos, selecionáveis por botão de rádio:
+
+#### Modo WSL (Linux) — padrão
+
+Usado em máquinas Windows com WSL2 instalado (Ubuntu ou outra distro).
+
+| Campo | Descrição | Padrão |
+|-------|-----------|--------|
+| **Distribuição WSL** | Nome exato da distro, conforme `wsl --list` | `Ubuntu` |
+| **Caminho do projeto (WSL)** | Caminho da pasta em notação Linux (`/mnt/c/...`) | Detectado automaticamente |
+
+O botão **↺** ao lado do caminho restaura o valor detectado automaticamente (pasta onde o `launcher.py` está).
+
+- **Compilação:** executa `make` dentro do WSL na pasta configurada
+- **Execução:** executa `./mandelbrot` com todos os parâmetros via `wsl -d <distro> -e bash -c "..."`
+- **Parar:** envia `pkill -TERM mandelbrot` diretamente no Linux (evita que o processo fique ativo em background) e depois encerra o processo do lado Windows
+
+#### Modo Windows Nativo
+
+Usado em máquinas com g++ e SDL2 instalados diretamente no Windows (MSYS2/MinGW ou similar), sem WSL.
+
+| Campo | Descrição | Padrão |
+|-------|-----------|--------|
+| **Caminho do projeto (Windows)** | Pasta onde estão `main.cpp` e onde `main.exe` será criado | Detectado automaticamente |
+
+O botão **↺** ao lado do caminho restaura o valor detectado automaticamente.
+
+- **Compilação:** executa `g++ main.cpp -O2 -std=c++17 -Wall -Wextra -march=native -o main.exe -lmingw32 -lSDL2main -lSDL2` diretamente no Windows, a partir da pasta configurada
+- **Execução:** executa `main.exe` com todos os parâmetros, a partir da pasta configurada
+- **Parar:** encerra o processo `main.exe` diretamente
+
+> **Requisito do modo Windows:** `g++` e as bibliotecas SDL2 (headers + `.dll`) devem estar no `PATH` do sistema. Se o comando `g++ --version` funcionar no PowerShell, o launcher consegue compilar.
+
+---
+
+### Seção Desempenho
+
+Localizada na **coluna esquerda**, controla os três parâmetros com maior impacto no FPS e na qualidade.
+
+| Campo | Tipo | Intervalo | Padrão | Efeito |
+|-------|------|-----------|--------|--------|
+| **Threads** | Spinbox | 1 – 32 | 4 | Número de threads paralelas. Ganho linear até o nº de núcleos físicos da CPU. Use o valor de `nproc` para desempenho máximo. |
+| **Máx. Iterações** | Spinbox | 32 – 4096 | 256 | Teto de iterações por pixel. Define o detalhe na fronteira do conjunto. Valores altos = mais detalhe, menos FPS. O programa cresce esse valor automaticamente em zoom profundo. |
+| **Tamanho do Bloco** | Spinbox | 4 – 128 | 32 | Lado (em pixels) de cada bloco de trabalho. Blocos menores melhoram o balanceamento entre threads, especialmente em zoom profundo. |
+
+Todos os campos são **Spinboxes**: use as setas ▲▼ para incremento/decremento ou clique no campo e digite o valor desejado diretamente.
+
+---
+
+### Seção Janela
+
+Localizada na **coluna esquerda**, define as dimensões da janela SDL2 que será aberta.
+
+| Campo | Tipo | Intervalo | Padrão |
+|-------|------|-----------|--------|
+| **Largura (px)** | Spinbox | 200 – 3840 | 900 |
+| **Altura (px)** | Spinbox | 200 – 2160 | 900 |
+
+A janela pode ter qualquer resolução dentro do intervalo. Janelas maiores consomem mais memória e aumentam o número de pixels a calcular por frame.
+
+---
+
+### Seção Paleta de Cores
+
+Localizada na **coluna esquerda**, permite escolher a coloração do fractal por botão de rádio. A mudança é aplicada no próximo clique em **Executar**.
+
+| Opção | Aparência |
+|-------|-----------|
+| **Padrão** | Canais R, G, B defasados 120° — resultado: azul/verde/roxo ciclando suavemente |
+| **Fogo** | Preto → vermelho → laranja → amarelo |
+| **Oceano** | Preto → azul escuro → ciano |
+| **Gold & Purple** | Ciclo arco-íris com dominância dourada e roxa |
+| **Cinza** | Escala de cinza pura — útil para análise de estrutura |
+
+---
+
+### Seção Ponto Alvo do Zoom
+
+Localizada na **coluna direita**, define o ponto do plano complexo para onde a câmera avança.
+
+> **Importante:** o ponto deve estar exatamente na **fronteira** do conjunto de Mandelbrot. Pontos no interior de um "lago" (bulbo ou cardioide) fazem a tela ficar completamente preta em zoom profundo — é matematicamente correto, mas visualmente parece travado.
+
+#### Preset
+
+Um menu dropdown com 6 pontos pré-validados:
+
+| Preset | X | Y | Característica visual |
+|--------|---|---|-----------------------|
+| **Seahorse Valley** *(padrão)* | `-0.7436…` | `0.1318…` | Espirais em ferradura, muito rico em detalhe |
+| **Elephant Valley** | `0.3245…` | `0.0485…` | Protuberâncias em forma de elefante |
+| **Triple Spiral** | `-0.1011` | `0.9563` | Três espirais simétricas no topo |
+| **Mini Mandelbrot** | `-1.7497…` | `0.0` | Cópia em miniatura do conjunto inteiro |
+| **Double Spiral** | `-0.7771` | `0.1166` | Espiral dupla densa |
+| **Lightning** | `-0.5990` | `0.6500` | Estruturas em forma de relâmpago |
+
+Ao selecionar um preset, os campos **X** e **Y** abaixo são preenchidos automaticamente.
+
+#### X (parte real) e Y (parte imaginária)
+
+Campos de texto livres. Permitem inserir qualquer coordenada decimal. Use `.` como separador decimal.
+
+---
+
+### Seção Velocidade do Zoom
+
+Localizada na **coluna direita**. Controla quanto a câmera avança por frame — quanto maior o valor, mais rápido o zoom entra.
+
+O controle combina **slider** (para ajuste rápido por arrasto) com **campo de texto editável** (para valores precisos):
+
+- **Slider:** intervalo de 1.001 a 1.050, passo 0.001
+- **Campo de texto:** aceita qualquer valor maior que 1.001 — basta digitar e pressionar **Enter** ou **Tab**. Valores acima de 1.050 (como `1.10` ou `1.20`) são aceitos e aplicados sem restrição.
+
+| Valor | Sensação |
+|-------|----------|
+| `1.003` | Muito lento, cinematográfico |
+| `1.008` | Lento e suave ← **padrão** |
+| `1.015` | Moderado |
+| `1.030` | Rápido |
+| `1.050` | Muito rápido |
+| `> 1.050` | Extremamente rápido (digitar no campo) |
+
+> **Lógica:** a escala é dividida pelo fator a cada frame (`scale /= zoom_factor`). Um fator maior que 1 faz `scale` diminuir, o que aumenta o zoom. Um fator de exatamente `1.0` pararia o zoom.
+
+---
+
+### Seção Delay Entre Frames
+
+Localizada na **coluna direita**. Insere uma pausa mínima entre frames, desacoplando a velocidade de renderização da velocidade do zoom.
+
+O controle combina **slider** (para ajuste rápido) com **campo de texto editável** (para valores precisos):
+
+- **Slider:** intervalo de 0 a 500 ms, passo 1
+- **Campo de texto:** aceita qualquer valor ≥ 0 — basta digitar e pressionar **Enter** ou **Tab**. Valores acima de 500 ms (como `1000` ou `2000`) são aceitos e aplicados.
+
+| Valor | Efeito |
+|-------|--------|
+| `0` | Sem limite — máxima velocidade de renderização ← **padrão** |
+| `16` | ≈ 60 FPS máximos |
+| `33` | ≈ 30 FPS máximos |
+| `100` | ≈ 10 FPS máximos |
+| `1000` | 1 frame por segundo (digitar no campo) |
+
+> **Diferença entre Delay e Zoom Factor:** o *Zoom Factor* controla **quanto** a câmera avança por frame; o *Delay* controla **de quanto em quanto tempo** um novo frame é renderizado. Para uma animação lenta e suave, use Zoom Factor próximo de `1.003` com Delay `0`. Para economizar CPU mantendo o zoom visual igual, aumente o Delay sem alterar o Zoom Factor.
+
+---
+
+### Preview do Comando
+
+Exibido logo abaixo dos cards de parâmetros, o campo **Comando** mostra em tempo real o comando exato que será executado ao clicar em **Executar**. Qualquer alteração nos parâmetros ou no ambiente atualiza o preview imediatamente.
+
+**Exemplo — modo WSL:**
+```
+wsl -d Ubuntu -e bash -c "cd '/mnt/c/Users/.../mandelbrot' && export DISPLAY=... && ./mandelbrot --threads 8 --max-iter 256 ..."
+```
+
+**Exemplo — modo Windows:**
+```
+.\main.exe --threads 8 --max-iter 256 --block-size 16 --width 900 --height 900 ...
+```
+
+---
+
+### Botões e indicadores
+
+#### Rodapé da interface
+
+| Elemento | Função |
+|----------|--------|
+| **Compilar (make)** | Compila o projeto. No modo WSL executa `make`; no modo Windows executa `g++` diretamente. A saída da compilação aparece no log. |
+| **Parar** | Encerra o processo em execução. Habilitado apenas enquanto o programa está rodando. No modo WSL envia `pkill` antes de encerrar o processo Windows, evitando processos zumbi. |
+| **● indicador** | Mostra o estado atual: verde = Pronto/Encerrado, amarelo = Compilando/Executando, vermelho = Erro/Parado. |
+| **▶ EXECUTAR** | Verifica se o binário existe (em background, sem travar a interface), e inicia o programa com os parâmetros configurados. Se o binário não existir, oferece compilar antes de executar. |
+
+#### Log de saída
+
+Painel de texto na parte inferior da janela que exibe em tempo real:
+- O comando executado (em azul)
+- Todo o `stdout` e `stderr` do programa (banner de inicialização, erros SDL2, etc.)
+- Mensagem de encerramento com o código de saída
 
 ---
 
