@@ -182,11 +182,15 @@ class Launcher:
         self.var_mode        = tk.StringVar(value="wsl")
         self.var_win_path    = tk.StringVar(value=SCRIPT_DIR)
 
+        self.var_overlay_enabled = tk.BooleanVar(value=True)
+        self.var_overlay_alpha = tk.IntVar(value=80)
+        self.var_overlay_threshold = tk.DoubleVar(value=0.90)
+
         for v in (self.var_threads, self.var_max_iter, self.var_block_size,
                   self.var_width, self.var_height, self.var_zoom_x,
                 self.var_zoom_y, self.var_zoom_percent, self.var_frame_delay,
                   self.var_palette, self.var_wsl_distro, self.var_wsl_path,
-                  self.var_win_path):
+                  self.var_win_path, self.var_overlay_enabled, self.var_overlay_alpha, self.var_overlay_threshold):
             v.trace_add("write", lambda *_: self._update_cmd())
 
     # ── UI ────────────────────────────────────────────────────────────────────
@@ -415,6 +419,116 @@ class Launcher:
         self._card_slider(right, "DELAY ENTRE FRAMES (ms)",
                           self.var_frame_delay, 0, 500, 1,
                           "frame_delay", fmt="{:.0f}")
+        
+        
+        # ── Overlay de custo ────────────────────────────────────────────────────────
+        overlay_outer = tk.Frame(right, bg=self._CARD)
+        overlay_outer.pack(fill="x", pady=(0, 8))
+
+        # Cabeçalho
+        header = tk.Frame(overlay_outer, bg=self._CARD)
+        header.pack(fill="x", padx=10, pady=(8, 4))
+
+        tk.Label(
+            header,
+            text="OVERLAY DE CUSTO",
+            bg=self._CARD,
+            fg="#45b7d1",
+            font=("Segoe UI", 9, "bold")
+        ).pack(side="left")
+
+        ttk.Checkbutton(
+            header,
+            text="Exibir Overlay",
+            variable=self.var_overlay_enabled
+        ).pack(side="right")
+
+        # Conteúdo
+        overlay_card = tk.Frame(overlay_outer, bg=self._CARD)
+        overlay_card.pack(fill="x", padx=10, pady=(0, 10))
+
+        row = tk.Frame(overlay_card, bg=self._CARD)
+        row.pack(anchor="w")
+
+        # ── Transparência ──────────────────────────────────────────────────
+        alpha_frame = tk.Frame(row, bg=self._CARD)
+        alpha_frame.pack(side="left", padx=(0, 24))
+
+        tk.Label(
+            alpha_frame,
+            text="Transparência",
+            bg=self._CARD,
+            fg="#e0e0e0"
+        ).pack(anchor="w")
+
+        ttk.Spinbox(
+            alpha_frame,
+            from_=0,
+            to=255,
+            width=6,
+            textvariable=self.var_overlay_alpha
+        ).pack(anchor="w", pady=(2, 0))
+
+        # ── Percentil ──────────────────────────────────────────────────────
+        percent_frame = tk.Frame(row, bg=self._CARD)
+        percent_frame.pack(side="left")
+
+        tk.Label(
+            percent_frame,
+            text="Percentil",
+            bg=self._CARD,
+            fg="#e0e0e0"
+        ).pack(anchor="w")
+
+        slider_row = tk.Frame(percent_frame, bg=self._CARD)
+        slider_row.pack(anchor="w", pady=(2, 0))
+
+        threshold_lbl = tk.Label(
+            slider_row,
+            text=f"{self.var_overlay_threshold.get():.2f}",
+            bg=self._CARD,
+            fg="#4ecca3",
+            width=4,
+            anchor="e"
+        )
+
+        scale = ttk.Scale(
+            slider_row,
+            from_=0.0,
+            to=1.0,
+            variable=self.var_overlay_threshold,
+            length=140
+        )
+
+        scale.pack(side="left")
+        threshold_lbl.pack(side="left", padx=(8, 0))
+
+        def _update_threshold_label(*_):
+            threshold_lbl.config(
+                text=f"{self.var_overlay_threshold.get():.2f}"
+            )
+
+        self.var_overlay_threshold.trace_add(
+            "write",
+            _update_threshold_label
+        )
+
+        _update_threshold_label()
+
+        # Descrição
+        tk.Label(
+            overlay_card,
+            text=(
+                "Destaca os pixels mais custosos do frame. "
+                "Percentil 0.90 = exibe aproximadamente os 10% "
+                "pixels mais caros de calcular."
+            ),
+            bg=self._CARD,
+            fg=self._MUTE,
+            font=("Segoe UI", 8, "italic"),
+            wraplength=320,
+            justify="left"
+        ).pack(anchor="w", pady=(8, 0))
 
         # ── Preview do comando ────────────────────────────────────────────────
         sep_frame = tk.Frame(R, bg="#1a1a2e")
@@ -637,6 +751,9 @@ class Launcher:
             "--zoom-factor", zoom_factor_from_percent(),
             "--frame-delay", si(self.var_frame_delay, 0),
             "--palette",     si(self.var_palette,     0),
+            "--overlay", "1" if self.var_overlay_enabled.get() else "0",
+            "--overlay-alpha", str(self.var_overlay_alpha.get()),
+            "--overlay-threshold", f"{self.var_overlay_threshold.get():.2f}"
         ]
 
     def _update_cmd(self):

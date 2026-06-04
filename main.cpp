@@ -52,6 +52,10 @@ struct Config
     double zoom_x, zoom_y;
     double scale_initial, scale_min, zoom_factor;
     int block_size, phase_cap;
+
+    int overlay_alpha;
+    double overlay_threshold;
+    bool overlay_enabled;
 };
 
 struct SharedCtx
@@ -292,6 +296,12 @@ int main(int argc, char *argv[])
     cfg.scale_min = 1e-13;
     cfg.phase_cap = std::max(0, arg_int(argc, argv, "--phase-cap", 0));
 
+    cfg.overlay_alpha = std::clamp(arg_int(argc, argv, "--overlay-alpha", 80), 0, 255);
+
+    cfg.overlay_threshold = std::clamp(arg_dbl(argc, argv, "--overlay-threshold", 0.90), 0.0, 1.0);
+
+    cfg.overlay_enabled = arg_int(argc, argv, "--overlay", 1) != 0;
+
     const int num_threads = std::max(1, arg_int(argc, argv, "--threads", 4));
 
     g_blocks_x = (cfg.win_w + cfg.block_size - 1) / cfg.block_size;
@@ -389,7 +399,10 @@ int main(int argc, char *argv[])
                     uint64_t c = g_metrics[by * g_blocks_x + bx].us_elapsed.load(std::memory_order_relaxed);
                     double t = (double)(c - cost_min) / (double)cost_range;
 
-                    if (t < 0.90)
+                    if (!cfg.overlay_enabled)
+                        continue;
+
+                    if (t < cfg.overlay_threshold)
                         continue;
 
                     SDL_SetRenderDrawColor(
@@ -397,7 +410,7 @@ int main(int argc, char *argv[])
                         255,
                         0,
                         0,
-                        80);
+                        cfg.overlay_alpha);
 
                     SDL_Rect rect = {
                         bx * BS, by * BS,
