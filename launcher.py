@@ -89,6 +89,7 @@ class Launcher:
         self.root.resizable(True, True)
         self.root.configure(bg="#1a1a2e")
         self._proc = None
+        self._stop_requested = False
 
         self._setup_style()
         self._setup_vars()
@@ -753,6 +754,7 @@ class Launcher:
 
         self._set_status("Executando…", "#f9ca24")
         self.stop_btn.config(state="normal")
+        self._stop_requested = False
 
         def _worker():
             try:
@@ -767,6 +769,10 @@ class Launcher:
                     self._log(line.rstrip())
                 self._proc.wait()
                 code = self._proc.returncode
+                if self._stop_requested:
+                    self._log("Processo encerrado após interrupção do usuário.", "#f9ca24")
+                    self._set_status("Parado", "#f9ca24")
+                    return
                 if code == 0:
                     self._log("Processo encerrado.", "#4ecca3")
                     self._set_status("Encerrado", "#4ecca3")
@@ -789,6 +795,7 @@ class Launcher:
     def _stop(self):
         if self._proc:
             try:
+                self._stop_requested = True
                 if self.var_mode.get() == "wsl":
                     # Mata o processo mandelbrot diretamente no Linux antes de
                     # matar o wsl.exe — evita que ele fique zumbi no WSL
@@ -798,7 +805,7 @@ class Launcher:
                     )
                 self._proc.terminate()
                 self._log("Processo interrompido pelo usuário.", "#e94560")
-                self._set_status("Parado", "#e94560")
+                self._set_status("Parado", "#f9ca24")
             except Exception as e:
                 self._log(f"Erro ao parar: {e}", "#e94560")
 
