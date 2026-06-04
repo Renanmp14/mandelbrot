@@ -802,7 +802,11 @@ class Launcher:
 
     def _compile(self, then_run=False):
         if self.var_mode.get() == "wsl":
-            bash_cmd = f"cd '{self._wsldir()}' && {_WSL_ENV}make 2>&1"
+            bash_cmd = (
+                f"cd '{self._wsldir()}' && "
+                f"rm -f mandelbrot && "
+                f"{_WSL_ENV}make 2>&1"
+            )
             argv = self._wsl_argv(bash_cmd)
             cwd  = None
             self._log("Compilando com make (WSL)…", "#45b7d1")
