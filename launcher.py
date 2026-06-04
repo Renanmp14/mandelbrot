@@ -691,45 +691,34 @@ class Launcher:
 
     def _run(self):
         if self._proc is not None:
-            messagebox.showinfo("Em execução",
-                "Um processo já está rodando.\nClique em Parar antes de executar novamente.")
+            messagebox.showinfo(
+                "Em execução",
+                "Um processo já está rodando.\nClique em Parar antes de executar novamente."
+            )
             return
 
         if not self._validate():
             return
 
-        self._set_status("Verificando…", "#f9ca24")
+        self._set_status("Preparando compilação…", "#f9ca24")
 
-        # Roda em background para não travar a UI enquanto o WSL inicializa
-        def _check():
-            try:
-                if self.var_mode.get() == "wsl":
-                    result = subprocess.run(
-                        self._wsl_argv(
-                            f"test -f '{self._wsldir()}/mandelbrot' && echo OK || echo MISSING"
-                        ),
-                        capture_output=True, text=True, timeout=20
-                    )
-                    found = result.returncode == 0 and "OK" in result.stdout
-                else:
-                    import os
-                    found = os.path.isfile(os.path.join(self._windir(), "main.exe"))
-            except Exception:
-                found = False
+        try:
+            if self.var_mode.get() == "windows":
+                exe_path = os.path.join(self._windir(), "main.exe")
 
-            if found:
-                self.root.after(0, self._do_run)
-            else:
-                def _ask():
-                    self._set_status("  Pronto", "#4ecca3")
-                    name = "mandelbrot" if self.var_mode.get() == "wsl" else "main.exe"
-                    if messagebox.askyesno("Binário não encontrado",
-                            f"O executável '{name}' não foi compilado ainda.\n\n"
-                            "Deseja compilar agora antes de executar?"):
-                        self._compile(then_run=True)
-                self.root.after(0, _ask)
+                if os.path.exists(exe_path):
+                    try:
+                        os.remove(exe_path)
+                        self._log("main.exe removido.", "#f9ca24")
+                    except Exception as e:
+                        self._log(f"Falha ao remover main.exe: {e}", "#e94560")
+                        return
 
-        threading.Thread(target=_check, daemon=True).start()
+        except Exception as e:
+            self._log(f"Erro ao preparar compilação: {e}", "#e94560")
+            return
+
+        self._compile(then_run=True)
 
     def _do_run(self):
         try:
@@ -839,12 +828,12 @@ class Launcher:
                     self._log(line.rstrip())
                 proc.wait()
                 if proc.returncode == 0:
-                    self._log("✔ Compilação concluída com sucesso!", "#4ecca3")
+                    self._log("Compilação concluída com sucesso!", "#4ecca3")
                     self._set_status("Compilado", "#4ecca3")
                     if then_run:
                         self.root.after(200, self._do_run)
                 else:
-                    self._log(f"✘ Falha na compilação (código {proc.returncode}).", "#e94560")
+                    self._log(f" Falha na compilação (código {proc.returncode}).", "#e94560")
                     self._set_status("Falha na compilação", "#e94560")
             except FileNotFoundError:
                 tool = "wsl" if self.var_mode.get() == "wsl" else "g++"
