@@ -10,7 +10,7 @@
 #include <cstring>
 #include <cstdint>
 #include <algorithm>
-#include <string>
+#include <chrono>
 
 // ════════════════════════════════════════════════════════════
 //  ARGUMENTOS
@@ -52,7 +52,6 @@ struct Config
     double zoom_x, zoom_y;
     double scale_initial, scale_min, zoom_factor;
     int block_size, phase_cap;
-    double iter_bias;
 };
 
 struct SharedCtx
@@ -66,44 +65,41 @@ struct SharedCtx
     bool shutdown;
 };
 
+// ── Métricas reais por bloco (escritas pelo worker, lidas pela main) ─────────
+// Sem mutex: cada bloco é território exclusivo de um worker por vez.
+// A main lê com relaxed — artefato visual ocasional é aceitável.
 static int g_blocks_x = 0;
 static int g_blocks_y = 0;
 static int g_num_blocks = 0;
-static std::atomic<uint64_t> *g_block_phase = nullptr;
 
-// ════════════════════════════════════════════════════════════
-//  WORKLOAD POR REGIÃO
-// ════════════════════════════════════════════════════════════
-
-static int block_max_iter(const Config &cfg, int x0, int y0, int x1, int y1)
+struct BlockMetrics
 {
-    if (cfg.iter_bias <= 0.0)
-        return cfg.max_iter_base;
-
-    double bx = (x0 + x1) * 0.5 / cfg.win_w;
-    double by = (y0 + y1) * 0.5 / cfg.win_h;
-    double dx = (bx - 0.5) * 2.0;
-    double dy = (by - 0.5) * 2.0;
-    double dist = std::min(std::sqrt(dx * dx + dy * dy) / 1.414, 1.0);
-    double t = (1.0 - dist) * cfg.iter_bias;
-
-    return std::max(cfg.max_iter_base,
-                    std::min((int)(cfg.max_iter_base + t * (cfg.max_iter_cap - cfg.max_iter_base)),
-                             cfg.max_iter_cap));
-}
+    std::atomic<uint64_t> iter_count; // total de iterações do último cálculo
+    std::atomic<uint64_t> us_elapsed; // tempo de processamento em microssegundos
+};
+static BlockMetrics *g_metrics = nullptr;
 
 // ════════════════════════════════════════════════════════════
 //  KERNEL MANDELBROT
 // ════════════════════════════════════════════════════════════
 
-static uint32_t compute_pixel(double px, double py, int max_iter, int palette)
+// Retorna a cor ARGB e acumula o número de iterações em `iter_out`.
+// Nenhuma heurística de posição — custo depende exclusivamente da matemática.
+static uint32_t compute_pixel(double px, double py, int max_iter, int palette,
+                              uint64_t &iter_out)
 {
     {
         double q = (px - 0.25) * (px - 0.25) + py * py;
         if (q * (q + px - 0.25) < 0.25 * py * py)
+        {
+            iter_out += max_iter;
             return 0xFF000000;
+        }
         if ((px + 1.0) * (px + 1.0) + py * py < 0.0625)
+        {
+            iter_out += max_iter;
             return 0xFF000000;
+        }
     }
 
     double zr = 0, zi = 0, zr2 = 0, zi2 = 0;
@@ -119,7 +115,10 @@ static uint32_t compute_pixel(double px, double py, int max_iter, int palette)
         zi2 = zi * zi;
         iter++;
         if (std::abs(zr - xold) < 1e-10 && std::abs(zi - yold) < 1e-10)
+        {
+            iter_out += (uint64_t)iter;
             return 0xFF000000;
+        }
         if (++since_check == check_at)
         {
             xold = zr;
@@ -129,6 +128,9 @@ static uint32_t compute_pixel(double px, double py, int max_iter, int palette)
                 check_at *= 2;
         }
     }
+
+    iter_out += (uint64_t)iter;
+
     if (iter == max_iter)
         return 0xFF000000;
 
@@ -193,25 +195,43 @@ static void *worker_func(void *arg)
         ctx->task_queue.pop();
         pthread_mutex_unlock(&ctx->task_mutex);
 
+        // Escala depende apenas da fase — nenhuma heurística de posição
         double log_scale = std::log(cfg.scale_initial) - (double)task.phase * std::log(cfg.zoom_factor);
         bool precision_limit = (log_scale < std::log(cfg.scale_min));
         double scale = precision_limit ? cfg.scale_min : std::exp(log_scale);
 
+        // max_iter depende apenas da profundidade de zoom — igual para todos os blocos
         double zoom_depth = cfg.scale_initial / scale;
         double growth = 16.0 * std::sqrt(std::log2(1.0 + zoom_depth));
-        int dyn_iter = cfg.max_iter_base + (int)growth;
-        int reg_iter = block_max_iter(cfg, task.x0, task.y0, task.x1, task.y1);
-        int max_iter = std::max(cfg.max_iter_base, std::min({dyn_iter, reg_iter, cfg.max_iter_cap}));
+        int max_iter = std::min(cfg.max_iter_base + (int)growth, cfg.max_iter_cap);
 
         const int W = cfg.win_w, H = cfg.win_h;
+
+        // ── Instrumentação: timestamp de início ──────────────────────
+        auto t0 = std::chrono::steady_clock::now();
+
+        uint64_t block_iters = 0;
         for (int py = task.y0; py < task.y1; py++)
             for (int px = task.x0; px < task.x1; px++)
             {
                 double cx = cfg.zoom_x + (px - W * 0.5) * scale;
                 double cy = cfg.zoom_y + (py - H * 0.5) * scale;
-                ctx->pixels[py * W + px] = compute_pixel(cx, cy, max_iter, cfg.palette);
+                ctx->pixels[py * W + px] = compute_pixel(cx, cy, max_iter, cfg.palette, block_iters);
             }
 
+        // ── Instrumentação: timestamp de fim ─────────────────────────
+        auto t1 = std::chrono::steady_clock::now();
+        uint64_t us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+
+        // ── Grava métricas reais no slot do bloco ────────────────────
+        int idx = (task.y0 / cfg.block_size) * g_blocks_x + (task.x0 / cfg.block_size);
+        if (idx >= 0 && idx < g_num_blocks)
+        {
+            g_metrics[idx].iter_count.store(block_iters, std::memory_order_relaxed);
+            g_metrics[idx].us_elapsed.store(us, std::memory_order_relaxed);
+        }
+
+        // ── Telemetria de fase máxima ────────────────────────────────
         uint64_t prev = ctx->max_phase_seen.load(std::memory_order_relaxed);
         while (task.phase > prev &&
                !ctx->max_phase_seen.compare_exchange_weak(prev, task.phase,
@@ -219,12 +239,7 @@ static void *worker_func(void *arg)
         {
         }
 
-        {
-            int idx = (task.y0 / cfg.block_size) * g_blocks_x + (task.x0 / cfg.block_size);
-            if (idx >= 0 && idx < g_num_blocks)
-                g_block_phase[idx].store(task.phase, std::memory_order_relaxed);
-        }
-
+        // ── Reinsere bloco com phase+1 ───────────────────────────────
         bool at_cap = (cfg.phase_cap > 0 && (int64_t)task.phase >= cfg.phase_cap - 1);
         if (!at_cap)
         {
@@ -266,8 +281,8 @@ int main(int argc, char *argv[])
     Config cfg;
     cfg.win_w = std::max(200, arg_int(argc, argv, "--width", 900));
     cfg.win_h = std::max(200, arg_int(argc, argv, "--height", 900));
-    cfg.max_iter_base = std::max(16, arg_int(argc, argv, "--max-iter", 64));
-    cfg.max_iter_cap = cfg.max_iter_base * 8;
+    cfg.max_iter_base = std::max(16, arg_int(argc, argv, "--max-iter", 256));
+    cfg.max_iter_cap = cfg.max_iter_base * 4;
     cfg.block_size = std::max(4, arg_int(argc, argv, "--block-size", 64));
     cfg.palette = arg_int(argc, argv, "--palette", 0);
     cfg.zoom_x = arg_dbl(argc, argv, "--zoom-x", -0.7436438885706799);
@@ -276,23 +291,24 @@ int main(int argc, char *argv[])
     cfg.scale_initial = 3.5 / cfg.win_w;
     cfg.scale_min = 1e-13;
     cfg.phase_cap = std::max(0, arg_int(argc, argv, "--phase-cap", 0));
-    cfg.iter_bias = std::max(0.0, std::min(1.0, arg_dbl(argc, argv, "--iter-bias", 1.0)));
 
     const int num_threads = std::max(1, arg_int(argc, argv, "--threads", 4));
 
     g_blocks_x = (cfg.win_w + cfg.block_size - 1) / cfg.block_size;
     g_blocks_y = (cfg.win_h + cfg.block_size - 1) / cfg.block_size;
     g_num_blocks = g_blocks_x * g_blocks_y;
-    g_block_phase = new std::atomic<uint64_t>[g_num_blocks];
+    g_metrics = new BlockMetrics[g_num_blocks];
     for (int i = 0; i < g_num_blocks; i++)
-        g_block_phase[i].store(0);
+    {
+        g_metrics[i].iter_count.store(0);
+        g_metrics[i].us_elapsed.store(0);
+    }
 
     printf("╔══ Mandelbrot — Fases Paralelas ════════════════════╗\n");
     printf("║  threads      = %d\n", num_threads);
     printf("║  max_iter     = %d → %d\n", cfg.max_iter_base, cfg.max_iter_cap);
     printf("║  block_size   = %d×%d px\n", cfg.block_size, cfg.block_size);
     printf("║  janela       = %d×%d px\n", cfg.win_w, cfg.win_h);
-    printf("║  iter_bias    = %.2f\n", cfg.iter_bias);
     printf("║  palette      = %d\n", cfg.palette);
     printf("╚════════════════════════════════════════════════════╝\n\n");
 
@@ -348,48 +364,41 @@ int main(int argc, char *argv[])
         SDL_RenderClear(renderer);
         SDL_RenderCopy(renderer, tex, nullptr, nullptr);
 
-        // ── Overlay: pinta apenas os blocos atrasados em laranja→vermelho ──
+        // ── Overlay de custo real ────────────────────────────────────────
+        // Usa us_elapsed como métrica primária (tempo real de CPU por bloco).
+        // Coleta min e max para normalizar — nenhum limite fixo, tudo relativo.
         {
-            // Calcula a fase média entre todos os blocos
-            double sum = 0.0;
-            for (int i = 0; i < g_num_blocks; i++)
-                sum += (double)g_block_phase[i].load(std::memory_order_relaxed);
-            double avg = sum / (double)g_num_blocks;
-
-            // Fase mínima (bloco mais lento) para normalizar o atraso
-            uint64_t ph_min = UINT64_MAX;
+            uint64_t cost_min = UINT64_MAX, cost_max = 0;
             for (int i = 0; i < g_num_blocks; i++)
             {
-                uint64_t p = g_block_phase[i].load(std::memory_order_relaxed);
-                if (p < ph_min)
-                    ph_min = p;
+                uint64_t c = g_metrics[i].us_elapsed.load(std::memory_order_relaxed);
+                if (c < cost_min)
+                    cost_min = c;
+                if (c > cost_max)
+                    cost_max = c;
             }
-
-            // Intervalo de atraso: de avg até ph_min (quanto mais longe, mais vermelho)
-            double lag_range = std::max(1.0, avg - (double)ph_min);
+            if (cost_min == UINT64_MAX)
+                cost_min = 0;
+            uint64_t cost_range = (cost_max > cost_min) ? (cost_max - cost_min) : 1;
 
             const int BS = cfg.block_size;
             for (int by = 0; by < g_blocks_y; by++)
             {
                 for (int bx = 0; bx < g_blocks_x; bx++)
                 {
-                    uint64_t ph = g_block_phase[by * g_blocks_x + bx].load(std::memory_order_relaxed);
-                    double lag = avg - (double)ph; // positivo = atrasado
+                    uint64_t c = g_metrics[by * g_blocks_x + bx].us_elapsed.load(std::memory_order_relaxed);
+                    double t = (double)(c - cost_min) / (double)cost_range;
 
-                    if (lag <= 0.0)
-                        continue; // no ritmo ou adiantado: sem overlay
+                    if (t < 0.90)
+                        continue;
 
-                    // t ∈ [0, 1]: 0 = levemente atrasado (laranja), 1 = muito atrasado (vermelho)
-                    double t = std::min(lag / lag_range, 1.0);
+                    SDL_SetRenderDrawColor(
+                        renderer,
+                        255,
+                        0,
+                        0,
+                        80);
 
-                    // laranja (255,140,0) → vermelho (220,0,0)
-                    uint8_t R = (uint8_t)(255 - (int)(35.0 * t));  // 255 → 220
-                    uint8_t G = (uint8_t)(140 - (int)(140.0 * t)); // 140 → 0
-                    uint8_t B = 0;
-                    // alpha cresce com o atraso: 60 (quase invisível) → 200 (bem opaco)
-                    uint8_t A = (uint8_t)(60 + (int)(140.0 * t));
-
-                    SDL_SetRenderDrawColor(renderer, R, G, B, A);
                     SDL_Rect rect = {
                         bx * BS, by * BS,
                         std::min(BS, cfg.win_w - bx * BS),
@@ -399,9 +408,9 @@ int main(int argc, char *argv[])
             }
         }
 
-        // ── Grid ──────────────────────────────────────────────────────────
+        // ── Grid ─────────────────────────────────────────────────────────
         {
-            SDL_SetRenderDrawColor(renderer, 255, 255, 255, 80);
+            SDL_SetRenderDrawColor(renderer, 255, 255, 255, 60);
             const int BS = cfg.block_size;
             for (int x = 0; x <= cfg.win_w; x += BS)
                 SDL_RenderDrawLine(renderer, x, 0, x, cfg.win_h - 1);
@@ -415,23 +424,24 @@ int main(int argc, char *argv[])
         Uint32 now = SDL_GetTicks();
         if (now - fps_t0 >= 1000)
         {
-            uint64_t ph_min = UINT64_MAX, ph_max = 0;
+            uint64_t cost_min = UINT64_MAX, cost_max = 0;
             for (int i = 0; i < g_num_blocks; i++)
             {
-                uint64_t p = g_block_phase[i].load(std::memory_order_relaxed);
-                if (p < ph_min)
-                    ph_min = p;
-                if (p > ph_max)
-                    ph_max = p;
+                uint64_t c = g_metrics[i].us_elapsed.load(std::memory_order_relaxed);
+                if (c < cost_min)
+                    cost_min = c;
+                if (c > cost_max)
+                    cost_max = c;
             }
-            if (ph_min == UINT64_MAX)
-                ph_min = 0;
+            if (cost_min == UINT64_MAX)
+                cost_min = 0;
+            uint64_t fase_max = ctx.max_phase_seen.load(std::memory_order_relaxed);
             snprintf(title, sizeof(title),
-                     "Mandelbrot | FPS:%u | fase min:%llu max:%llu spread:%llu",
+                     "Mandelbrot | FPS:%u | fase_max:%llu | custo min:%lluµs max:%lluµs",
                      fps_frames,
-                     (unsigned long long)ph_min,
-                     (unsigned long long)ph_max,
-                     (unsigned long long)(ph_max - ph_min));
+                     (unsigned long long)fase_max,
+                     (unsigned long long)cost_min,
+                     (unsigned long long)cost_max);
             SDL_SetWindowTitle(window, title);
             fps_frames = 0;
             fps_t0 = now;
@@ -443,9 +453,7 @@ int main(int argc, char *argv[])
             bool vazia = ctx.task_queue.empty();
             pthread_mutex_unlock(&ctx.task_mutex);
             if (vazia)
-            {
                 running = false;
-            }
         }
     }
 
@@ -463,6 +471,6 @@ int main(int argc, char *argv[])
     pthread_mutex_destroy(&ctx.task_mutex);
     pthread_cond_destroy(&ctx.task_cond);
     delete[] ctx.pixels;
-    delete[] g_block_phase;
+    delete[] g_metrics;
     return 0;
 }

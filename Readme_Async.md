@@ -84,7 +84,7 @@ struct Task {
 };
 ```
 
-Unidade básica de trabalho. Cada `Task` descreve um bloco retangular da tela e o nível de zoom (`phase`) em que deve ser calculado. Um `Task` na fase `N` produz um `Task` na fase `N+1` ao terminar — sem nenhuma coordenação central.
+Unidade básica de trabalho. Cada `Task` descreve um bloco retangular da tela e o nível de zoom (`phase`) em que deve ser calculado. Uma `Task` na fase `N` produz uma `Task` na fase `N+1` ao terminar — sem nenhuma coordenação central.
 
 ---
 
