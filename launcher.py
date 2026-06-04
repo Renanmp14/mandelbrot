@@ -68,9 +68,8 @@ DESC = {
         "Coordenada Y (parte imaginária) do ponto-alvo.\n"
         "⚠ Pontos no interior causam tela preta em zoom profundo.",
     "zoom_factor":
-        "Fator de aproximação por frame (> 1.0). Arraste o slider ou digite diretamente e pressione Enter.\n"
-        "1.003 = muito lento   1.008 = lento ← padrão   1.015 = moderado   1.030 = muito rápido\n"
-        "Valores acima de 1.050 são aceitos digitando no campo.",
+        "Fator matemático: f = 1 + p/100. Ex.: 0.8% -> 1.0080.\n"
+        "Use a porcentagem para controlar a velocidade do zoom.",
     "frame_delay":
         "Pausa mínima entre frames em milissegundos. Arraste ou digite e pressione Enter.\n"
         "0 = máxima velocidade   16 ≈ 60 FPS   33 ≈ 30 FPS   100 ≈ 10 FPS\n"
@@ -86,6 +85,7 @@ class Launcher:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Mandelbrot Launcher")
+        self.root.geometry("1000x600")
         self.root.resizable(True, True)
         self.root.configure(bg="#1a1a2e")
         self._proc = None
@@ -167,11 +167,11 @@ class Launcher:
         self.var_threads     = tk.IntVar(value=4)
         self.var_max_iter    = tk.IntVar(value=256)
         self.var_block_size  = tk.IntVar(value=32)
-        self.var_width       = tk.IntVar(value=900)
-        self.var_height      = tk.IntVar(value=900)
+        self.var_width       = tk.IntVar(value=700)
+        self.var_height      = tk.IntVar(value=500)
         self.var_zoom_x      = tk.StringVar(value="-0.7436438885706799")
         self.var_zoom_y      = tk.StringVar(value="0.1318259042053185")
-        self.var_zoom_factor = tk.DoubleVar(value=1.008)
+        self.var_zoom_percent = tk.DoubleVar(value=0.8)
         self.var_frame_delay = tk.IntVar(value=0)
         self.var_palette     = tk.IntVar(value=0)
         self.var_preset      = tk.StringVar(value="Seahorse Valley")
@@ -183,7 +183,7 @@ class Launcher:
 
         for v in (self.var_threads, self.var_max_iter, self.var_block_size,
                   self.var_width, self.var_height, self.var_zoom_x,
-                  self.var_zoom_y, self.var_zoom_factor, self.var_frame_delay,
+                self.var_zoom_y, self.var_zoom_percent, self.var_frame_delay,
                   self.var_palette, self.var_wsl_distro, self.var_wsl_path,
                   self.var_win_path):
             v.trace_add("write", lambda *_: self._update_cmd())
@@ -192,7 +192,59 @@ class Launcher:
 
     def _build_ui(self):
         R = self.root
+        BG = "#1a1a2e"
         CARD = self._CARD
+
+        # ── Área rolável ────────────────────────────────────────────────────
+        scroll_outer = tk.Frame(R, bg=BG)
+        scroll_outer.pack(fill="both", expand=True)
+
+        scroll_canvas = tk.Canvas(scroll_outer, bg=BG, highlightthickness=0, bd=0)
+        scroll_canvas.pack(side="left", fill="both", expand=True)
+
+        scroll_bar = ttk.Scrollbar(scroll_outer, orient="vertical",
+                                   command=scroll_canvas.yview)
+        scroll_bar.pack(side="right", fill="y")
+
+        scroll_canvas.configure(yscrollcommand=scroll_bar.set)
+
+        content = tk.Frame(scroll_canvas, bg=BG)
+        content_id = scroll_canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def _sync_scrollregion(_=None):
+            scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all"))
+
+        def _sync_content_width(event):
+            scroll_canvas.itemconfigure(content_id, width=event.width)
+
+        def _on_mousewheel(event):
+            if event.delta:
+                scroll_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                return "break"
+
+        def _on_linux_scroll(event):
+            if event.num == 4:
+                scroll_canvas.yview_scroll(-3, "units")
+            elif event.num == 5:
+                scroll_canvas.yview_scroll(3, "units")
+            return "break"
+
+        def _bind_mousewheel(_=None):
+            scroll_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            scroll_canvas.bind_all("<Button-4>", _on_linux_scroll)
+            scroll_canvas.bind_all("<Button-5>", _on_linux_scroll)
+
+        def _unbind_mousewheel(_=None):
+            scroll_canvas.unbind_all("<MouseWheel>")
+            scroll_canvas.unbind_all("<Button-4>")
+            scroll_canvas.unbind_all("<Button-5>")
+
+        content.bind("<Configure>", _sync_scrollregion)
+        scroll_canvas.bind("<Configure>", _sync_content_width)
+        scroll_canvas.bind("<Enter>", _bind_mousewheel)
+        scroll_canvas.bind("<Leave>", _unbind_mousewheel)
+
+        R = content
 
         # ── Cabeçalho ─────────────────────────────────────────────────────────
         hdr = tk.Frame(R, bg="#1a1a2e")
@@ -356,9 +408,9 @@ class Launcher:
                  wraplength=300, justify="left").pack(anchor="w", pady=(4, 0))
 
         # ── Velocidade ────────────────────────────────────────────────────────
-        self._card_slider(right, "VELOCIDADE DO ZOOM",
-                          self.var_zoom_factor, 1.001, 1.050, 0.001,
-                          "zoom_factor", fmt="{:.4f}")
+        self._card_slider(right, "VELOCIDADE DO ZOOM (% por frame)",
+                  self.var_zoom_percent, 0.1, 5.0, 0.1,
+                  "zoom_factor", fmt="{:.1f}")
         self._card_slider(right, "DELAY ENTRE FRAMES (ms)",
                           self.var_frame_delay, 0, 500, 1,
                           "frame_delay", fmt="{:.0f}")
@@ -565,6 +617,13 @@ class Launcher:
             except Exception:
                 return str(default)
 
+        def zoom_factor_from_percent(default=1.008):
+            try:
+                percent = float(self.var_zoom_percent.get())
+                return f"{1.0 + (percent / 100.0):.4f}"
+            except Exception:
+                return f"{default:.4f}"
+
         return [
             "--threads",     si(self.var_threads,    4),
             "--max-iter",    si(self.var_max_iter,   256),
@@ -573,7 +632,8 @@ class Launcher:
             "--height",      si(self.var_height,     900),
             "--zoom-x",      ss(self.var_zoom_x,     -0.7436438885706799),
             "--zoom-y",      ss(self.var_zoom_y,      0.1318259042053185),
-            "--zoom-factor", sf(self.var_zoom_factor, "{:.4f}", 1.008),
+            # Converte a porcentagem escolhida no fator multiplicativo usado pelo executável.
+            "--zoom-factor", zoom_factor_from_percent(),
             "--frame-delay", si(self.var_frame_delay, 0),
             "--palette",     si(self.var_palette,     0),
         ]
@@ -620,9 +680,9 @@ class Launcher:
             messagebox.showerror("Erro",
                 "Ponto Alvo X e Y devem ser números decimais (use '.' como separador).")
             return False
-        if self.var_zoom_factor.get() <= 1.0:
+        if self.var_zoom_percent.get() <= 0.0:
             messagebox.showerror("Erro",
-                "Velocidade do Zoom deve ser maior que 1.0.")
+                "Velocidade do Zoom deve ser maior que 0%.")
             return False
         return True
 
