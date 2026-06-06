@@ -27,12 +27,14 @@ g++ -O2 -o mandelbrot main.cpp -lmingw32 -lSDL2main -lSDL2 -lpthread
 | `--zoom-y F` | `0.1318…` | Coordenada Y do alvo do zoom |
 | `--zoom-factor F` | `1.008` | Fator de zoom por fase |
 | `--palette N` | `0` | Paleta de cores (0–4) |
-| `--iter-bias F` | `1.0` | Contraste de carga entre regiões (0=uniforme, 1=máximo) |
 | `--phase-cap N` | `0` | Fase máxima por bloco (0 = infinito) |
+| `--overlay N` | `1` | Ativa o overlay de custo (1=ativo, 0=desativado) |
+| `--overlay-alpha N` | `80` | Opacidade do overlay (0–255) |
+| `--overlay-threshold F` | `0.90` | Percentil de custo a partir do qual o overlay exibe vermelho |
 
-**Exemplo para máximo contraste visual de fases:**
+**Exemplo:**
 ```bash
-./mandelbrot --threads 4 --block-size 64 --max-iter 32 --iter-bias 1.0
+./mandelbrot --threads 4 --block-size 64 --max-iter 32
 ```
 
 ---
@@ -92,7 +94,7 @@ Unidade básica de trabalho. Cada `Task` descreve um bloco retangular da tela e 
 
 Parâmetros globais imutáveis após a inicialização. Workers leem diretamente, sem mutex, porque nenhum campo é modificado durante a execução.
 
-Campo relevante: `iter_bias` — controla quanto o custo computacional varia entre blocos centrais e periféricos (ver `block_max_iter`).
+Todos os campos são imutáveis após a inicialização. Workers leem diretamente, sem mutex.
 
 ---
 
@@ -109,21 +111,6 @@ Estado verdadeiramente compartilhado entre threads:
 | `shutdown` | `bool` | Sinal de encerramento |
 
 O buffer `pixels` não precisa de mutex porque blocos distintos mapeiam para regiões distintas da memória — não há sobreposição de escrita entre workers.
-
----
-
-### `block_max_iter`
-
-```cpp
-static int block_max_iter(const Config& cfg, int x0, int y0, int x1, int y1)
-```
-
-Calcula o limite de iterações para um bloco com base em sua distância ao centro da tela. Com `iter_bias = 1.0`:
-
-- **Blocos centrais** → `max_iter_cap` (8× a base) — lentos, ficam para trás em fases
-- **Blocos de borda** → `max_iter_base` — rápidos, avançam muitas fases
-
-Isso cria diferença real e visível no avanço de fases entre regiões, tornando o comportamento assíncrono observável sem depender do conteúdo do fractal.
 
 ---
 
@@ -154,9 +141,9 @@ Loop principal de cada thread trabalhadora:
 1. Bloqueia no mutex aguardando tarefa na fila
 2. Retira uma Task da fila
 3. Calcula scale = exp(log(scale_initial) - phase × log(zoom_factor))
-4. Determina max_iter (dinâmico por zoom + regional por iter_bias)
+4. Determina max_iter (dinâmico por zoom, igual para todos os blocos na mesma fase)
 5. Calcula todos os pixels do bloco
-6. Registra a fase no array g_block_phase (para o overlay)
+6. Registra iter_count e us_elapsed em g_metrics[idx] (para o overlay)
 7. Reinsere o bloco com phase+1 na fila
 ```
 
@@ -176,21 +163,25 @@ A main thread não coordena workers. Ela apenas:
 
 1. Copia `ctx.pixels` para uma textura SDL2 (`SDL_UpdateTexture`)
 2. Renderiza o fractal
-3. **Overlay de fase:** para cada bloco, lê `g_block_phase[idx]` e desenha um retângulo semitransparente colorido proporcional ao avanço relativo do bloco (azul = atrasado, verde = médio, vermelho = adiantado)
+3. **Overlay de custo:** para cada bloco, lê `g_metrics[idx].us_elapsed` e desenha um retângulo vermelho semitransparente nos blocos acima do `overlay_threshold` (os mais caros relativamente)
 4. **Grid:** linhas brancas semitransparentes delimitando cada bloco
-5. Atualiza o título com FPS, fase mínima, fase máxima e spread
+5. Atualiza o título com FPS, fase máxima, custo mínimo e custo máximo em µs
 
 O overlay usa `SDL_BLENDMODE_BLEND` com alpha ≈ 60%, permitindo que o fractal apareça por baixo da coloração de fase.
 
 ---
 
-### `g_block_phase`
+### `g_metrics`
 
 ```cpp
-static std::atomic<uint64_t>* g_block_phase;
+struct BlockMetrics {
+    std::atomic<uint64_t> iter_count;
+    std::atomic<uint64_t> us_elapsed;
+};
+static BlockMetrics* g_metrics;
 ```
 
-Array global de atomics, um por bloco da grade. Workers escrevem com `memory_order_relaxed` (sem necessidade de ordem garantida — é telemetria visual). A main thread lê também com `relaxed` para montar o overlay.
+Array global, um `BlockMetrics` por bloco da grade. Workers escrevem com `memory_order_relaxed` ao terminar cada bloco — sem garantia de ordem, pois é apenas telemetria visual. A main thread lê com `relaxed` para montar o overlay.
 
 O índice de um bloco é `(y0 / block_size) * g_blocks_x + (x0 / block_size)`.
 
@@ -199,16 +190,17 @@ O índice de um bloco é `(y0 / block_size) * g_blocks_x + (x0 / block_size)`.
 ## Métricas no título da janela
 
 ```
-Mandelbrot | FPS:60 | fase min:12 max:847 spread:835
+Mandelbrot | FPS:60 | fase_max:847 | custo min:120µs max:4300µs
 ```
 
 | Métrica | Significado |
 |---|---|
-| `fase min` | Fase do bloco mais atrasado |
-| `fase max` | Fase do bloco mais adiantado |
-| `spread` | Diferença entre o mais rápido e o mais lento |
+| `FPS` | Frames por segundo da thread de renderização |
+| `fase_max` | Maior fase já alcançada por qualquer bloco |
+| `custo min` | Tempo de processamento do bloco mais barato no último segundo |
+| `custo max` | Tempo de processamento do bloco mais caro no último segundo |
 
-Um `spread` alto (centenas ou milhares) confirma que os blocos estão evoluindo de forma genuinamente assíncrona.
+Uma diferença grande entre `custo min` e `custo max` confirma que os blocos estão evoluindo de forma genuinamente assíncrona — blocos baratos acumulam muitas mais fases que os caros.
 
 ---
 
