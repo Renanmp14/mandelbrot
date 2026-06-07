@@ -313,29 +313,29 @@ g++ -O2 -std=c++17 -Wall -Wextra -march=native \
 ## Como executar
 
 ```bash
-./mandelbrot <num_threads> <max_iter> <block_size>
+./mandelbrot --threads <num_threads> --max-iter <max_iter> --block-size <block_size>
 ```
 
 ### A partir do Windows (PowerShell)
 
 ```powershell
-wsl -d Ubuntu -e bash -c "cd '/mnt/c/Users/<SEU_USUARIO>/Documents/_Faculdade/mandelbrot' && ./mandelbrot 4 256 32"
+wsl -d Ubuntu -e bash -c "cd '/mnt/c/Users/<SEU_USUARIO>/Documents/_Faculdade/mandelbrot' && ./mandelbrot --threads 4 --max-iter 256 --block-size 32"
 ```
 
 ### Exemplos de uso
 
 ```bash
 # Configuração padrão: 4 threads, 256 iterações, blocos 32×32
-./mandelbrot 4 256 32
+./mandelbrot --threads 4 --max-iter 256 --block-size 32
 
 # Alta qualidade: 8 threads, 512 iterações, blocos 16×16
-./mandelbrot 8 512 16
+./mandelbrot --threads 8 --max-iter 512 --block-size 16
 
 # Teste de desempenho: 1 thread (sem paralelismo)
-./mandelbrot 1 256 32
+./mandelbrot --threads 1 --max-iter 256 --block-size 32
 
 # Alta complexidade: 16 threads, 1024 iterações
-./mandelbrot 16 1024 32
+./mandelbrot --threads 16 --max-iter 1024 --block-size 32
 ```
 
 ### Controles durante a execução
@@ -930,7 +930,7 @@ O título da janela exibe **FPS** e **Zoom atual** em tempo real — use esses v
 ### O que cada parâmetro faz
 
 ```
-./mandelbrot <num_threads> <max_iter> <block_size>
+./mandelbrot --threads <num_threads> --max-iter <max_iter> --block-size <block_size>
 ```
 
 #### `num_threads` — Quantidade de threads trabalhadoras
@@ -1001,19 +1001,19 @@ Mantém `max_iter` e `block_size` fixos, varia apenas as threads. Observe o FPS 
 
 ```bash
 # 1 thread — baseline sem paralelismo
-./mandelbrot 1 256 32
+./mandelbrot --threads 1 --max-iter 256 --block-size 32
 
 # 2 threads
-./mandelbrot 2 256 32
+./mandelbrot --threads 2 --max-iter 256 --block-size 32
 
 # 4 threads
-./mandelbrot 4 256 32
+./mandelbrot --threads 4 --max-iter 256 --block-size 32
 
 # 8 threads (ou o valor de nproc)
-./mandelbrot 8 256 32
+./mandelbrot --threads 8 --max-iter 256 --block-size 32
 
 # 16 threads (se o CPU tiver núcleos suficientes)
-./mandelbrot 16 256 32
+./mandelbrot --threads 16 --max-iter 256 --block-size 32
 ```
 
 **O que observar:** o FPS deve crescer quase linearmente até o número de núcleos físicos. Acima disso, o ganho para ou até cai (contenção de contexto).
@@ -1026,19 +1026,19 @@ Mantém threads e `max_iter` fixos, varia apenas `block_size`. Mais evidente em 
 
 ```bash
 # Bloco grande — poucas tarefas, desequilíbrio alto em zoom profundo
-./mandelbrot 4 256 128
+./mandelbrot --threads 4 --max-iter 256 --block-size 128
 
 # Bloco médio-grande
-./mandelbrot 4 256 64
+./mandelbrot --threads 4 --max-iter 256 --block-size 64
 
 # Bloco médio (padrão original)
-./mandelbrot 4 256 32
+./mandelbrot --threads 4 --max-iter 256 --block-size 32
 
 # Bloco pequeno — muitas tarefas, melhor balanceamento
-./mandelbrot 4 256 16
+./mandelbrot --threads 4 --max-iter 256 --block-size 16
 
 # Bloco muito pequeno — overhead de sincronização começa a aparecer
-./mandelbrot 4 256 8
+./mandelbrot --threads 4 --max-iter 256 --block-size 8
 ```
 
 **O que observar:** em zoom inicial (1×–100×) o FPS é parecido. Em zoom profundo (1000×+) o `block_size=16` deve manter FPS significativamente mais alto que `block_size=64` ou `128`.
@@ -1051,19 +1051,19 @@ Mantém threads e `block_size` fixos, varia o teto de iterações. Afeta diretam
 
 ```bash
 # Menos detalhe, mais FPS
-./mandelbrot 4 64 32
+./mandelbrot --threads 4 --max-iter 64 --block-size 32
 
 # Qualidade baixa
-./mandelbrot 4 128 32
+./mandelbrot --threads 4 --max-iter 128 --block-size 32
 
 # Equilíbrio — recomendado
-./mandelbrot 4 256 32
+./mandelbrot --threads 4 --max-iter 256 --block-size 32
 
 # Alta qualidade, FPS mais baixo
-./mandelbrot 4 512 32
+./mandelbrot --threads 4 --max-iter 512 --block-size 32
 
 # Máximo detalhe (pesado)
-./mandelbrot 4 1024 32
+./mandelbrot --threads 4 --max-iter 1024 --block-size 32
 ```
 
 **O que observar:** com `max_iter` baixo (64), o zoom perde detalhe cedo — a fronteira fica "grossa" e sem estrutura. Com `max_iter` alto (1024), o detalhe é máximo mas o FPS cai consideravelmente em zoom profundo.
@@ -1076,16 +1076,16 @@ Com base nos testes anteriores, combine os melhores valores. Exemplos típicos:
 
 ```bash
 # Balanceado — boa qualidade + FPS estável
-./mandelbrot 8 128 16
+./mandelbrot --threads 8 --max-iter 128 --block-size 16
 
 # Performance máxima — FPS alto, qualidade razoável
-./mandelbrot 8 64 16
+./mandelbrot --threads 8 --max-iter 64 --block-size 16
 
 # Qualidade máxima — FPS pode cair, visual rico em zoom profundo
-./mandelbrot 8 512 16
+./mandelbrot --threads 8 --max-iter 512 --block-size 16
 
 # Para apresentação — zoom suave, visual equilibrado
-./mandelbrot 8 256 16
+./mandelbrot --threads 8 --max-iter 256 --block-size 16
 ```
 
 ---
@@ -1098,10 +1098,10 @@ Com base nos testes anteriores, combine os melhores valores. Exemplos típicos:
 # Rode cada um por ~30 segundos e compare o FPS médio exibido no título
 
 # Sem paralelismo
-./mandelbrot 1 256 16
+./mandelbrot --threads 1 --max-iter 256 --block-size 16
 
 # Com paralelismo total
-./mandelbrot 8 256 16
+./mandelbrot --threads 8 --max-iter 256 --block-size 16
 ```
 
 **Resultado esperado:** o FPS com N threads deve ser aproximadamente N× maior que com 1 thread, evidenciando o speedup do pool de Pthreads.

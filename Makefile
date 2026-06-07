@@ -17,7 +17,7 @@ $(TARGET): $(SRC)
 
 # Executa com parâmetros padrão: 4 threads, 256 iterações, blocos 32×32
 run: $(TARGET)
-	./$(TARGET) 4 256 32
+	./$(TARGET) --threads 4 --max-iter 256 --block-size 32
 
 clean:
 	rm -f $(TARGET)
