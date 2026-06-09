@@ -49,7 +49,7 @@ PALETTES = [
 DESC = {
     "threads":
         "Threads paralelas. Ganho linear até o nº de núcleos físicos da CPU.\n"
-        "Recomendado: use o resultado de 'nproc' no terminal WSL.",
+        "Recomendado: use o resultado de 'nproc' no terminal.",
     "max_iter":
         "Teto de iterações por pixel. Define o detalhe na fronteira.\n"
         "O programa cresce esse valor automaticamente em zoom profundo.\n"
@@ -181,6 +181,7 @@ class Launcher:
         self.var_wsl_path    = tk.StringVar(value=WSL_DIR)
         self.var_mode        = tk.StringVar(value="wsl")
         self.var_win_path    = tk.StringVar(value=SCRIPT_DIR)
+        self.var_linux_path  = tk.StringVar(value=SCRIPT_DIR)
 
         self.var_overlay_enabled = tk.BooleanVar(value=True)
         self.var_overlay_alpha = tk.IntVar(value=80)
@@ -188,9 +189,10 @@ class Launcher:
 
         for v in (self.var_threads, self.var_max_iter, self.var_block_size,
                   self.var_width, self.var_height, self.var_zoom_x,
-                self.var_zoom_y, self.var_zoom_percent, self.var_frame_delay,
+                  self.var_zoom_y, self.var_zoom_percent, self.var_frame_delay,
                   self.var_palette, self.var_wsl_distro, self.var_wsl_path,
-                  self.var_win_path, self.var_overlay_enabled, self.var_overlay_alpha, self.var_overlay_threshold):
+                  self.var_win_path, self.var_linux_path, self.var_overlay_enabled, 
+                  self.var_overlay_alpha, self.var_overlay_threshold):
             v.trace_add("write", lambda *_: self._update_cmd())
 
     # ── UI ────────────────────────────────────────────────────────────────────
@@ -274,6 +276,9 @@ class Launcher:
         mode_row.pack(fill="x", pady=(0, 8))
         tk.Label(mode_row, text="Modo:", bg=CARD, fg="#e0e0e0",
                  font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 10))
+        ttk.Radiobutton(mode_row, text="Linux Nativo",
+                        variable=self.var_mode, value="linux",
+                        command=self._on_mode_change).pack(side="left", padx=(0, 16))
         ttk.Radiobutton(mode_row, text="WSL (Linux)",
                         variable=self.var_mode, value="wsl",
                         command=self._on_mode_change).pack(side="left", padx=(0, 16))
@@ -281,9 +286,32 @@ class Launcher:
                         variable=self.var_mode, value="windows",
                         command=self._on_mode_change).pack(side="left")
 
+        # ── Campos Linux Nativo ───────────────────────────────────────────────
+        self._linux_fields = tk.Frame(env_inner, bg=CARD)
+        self._linux_fields.columnconfigure(1, weight=1)
+
+        tk.Label(self._linux_fields, text="Caminho do projeto (Linux)", bg=CARD,
+                 fg="#e0e0e0", font=("Segoe UI", 9, "bold"), anchor="w"
+                 ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+        lin_path_row = tk.Frame(self._linux_fields, bg=CARD)
+        lin_path_row.grid(row=0, column=1, sticky="ew")
+        lin_path_row.columnconfigure(0, weight=1)
+        ttk.Entry(lin_path_row, textvariable=self.var_linux_path,
+                  font=("Cascadia Code", 10)
+                  ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(lin_path_row, text="↺",
+                   command=lambda: self.var_linux_path.set(SCRIPT_DIR),
+                   width=3).grid(row=0, column=1)
+        tk.Label(self._linux_fields,
+                 text="Pasta onde estão o Makefile e main.cpp.  "
+                      "Compilação: executará 'make' na pasta.  "
+                      "↺ restaura o diretório local do launcher.",
+                 bg=CARD, fg=self._MUTE, font=("Segoe UI", 8, "italic"),
+                 wraplength=800, justify="left"
+                 ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
         # ── Campos WSL ────────────────────────────────────────────────────────
         self._wsl_fields = tk.Frame(env_inner, bg=CARD)
-        self._wsl_fields.pack(fill="x")
         self._wsl_fields.columnconfigure(1, weight=1)
         self._wsl_fields.columnconfigure(3, weight=4)
 
@@ -313,9 +341,8 @@ class Launcher:
                  wraplength=800, justify="left"
                  ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
-        # ── Campos Windows (oculto por padrão) ───────────────────────────────
+        # ── Campos Windows ────────────────────────────────────────────────────
         self._win_fields = tk.Frame(env_inner, bg=CARD)
-        # não empacotado ainda — aparece ao trocar para modo Windows
         self._win_fields.columnconfigure(1, weight=1)
 
         tk.Label(self._win_fields, text="Caminho do projeto (Windows)", bg=CARD,
@@ -337,6 +364,9 @@ class Launcher:
                  bg=CARD, fg=self._MUTE, font=("Segoe UI", 8, "italic"),
                  wraplength=800, justify="left"
                  ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        # Estado inicial do painel selecionado
+        self._on_mode_change()
 
         # ── Corpo: duas colunas ───────────────────────────────────────────────
         body = tk.Frame(R, bg="#1a1a2e")
@@ -689,16 +719,24 @@ class Launcher:
     def _windir(self) -> str:
         return self.var_win_path.get().strip() or SCRIPT_DIR
 
+    def _linuxdir(self) -> str:
+        return self.var_linux_path.get().strip() or SCRIPT_DIR
+
     def _wsl_argv(self, bash_cmd: str) -> list:
         return ["wsl", "-d", self._distro(), "-e", "bash", "-c", bash_cmd]
 
     def _on_mode_change(self):
-        if self.var_mode.get() == "wsl":
-            self._win_fields.pack_forget()
+        for f in (self._wsl_fields, self._win_fields, self._linux_fields):
+            f.pack_forget()
+
+        mode = self.var_mode.get()
+        if mode == "wsl":
             self._wsl_fields.pack(fill="x")
-        else:
-            self._wsl_fields.pack_forget()
+        elif mode == "windows":
             self._win_fields.pack(fill="x")
+        elif mode == "linux":
+            self._linux_fields.pack(fill="x")
+
         self._update_cmd()
 
     # ── Lógica ────────────────────────────────────────────────────────────────
@@ -759,9 +797,12 @@ class Launcher:
     def _update_cmd(self):
         try:
             args = self._build_args()
-            if self.var_mode.get() == "wsl":
+            mode = self.var_mode.get()
+            if mode == "wsl":
                 bash = f"cd '{self._wsldir()}' && ./mandelbrot " + " ".join(args)
                 full = f'wsl -d {self._distro()} -e bash -c "{bash}"'
+            elif mode == "linux":
+                full = f"cd '{self._linuxdir()}' && ./mandelbrot " + " ".join(args)
             else:
                 full = f'.\\main.exe ' + " ".join(args)
             self.cmd_text.config(state="normal")
@@ -820,16 +861,17 @@ class Launcher:
         self._set_status("Preparando compilação…", "#f9ca24")
 
         try:
-            if self.var_mode.get() == "windows":
+            mode = self.var_mode.get()
+            if mode == "windows":
                 exe_path = os.path.join(self._windir(), "main.exe")
-
                 if os.path.exists(exe_path):
-                    try:
-                        os.remove(exe_path)
-                        self._log("main.exe removido.", "#f9ca24")
-                    except Exception as e:
-                        self._log(f"Falha ao remover main.exe: {e}", "#e94560")
-                        return
+                    os.remove(exe_path)
+                    self._log("main.exe removido.", "#f9ca24")
+            elif mode == "linux":
+                exe_path = os.path.join(self._linuxdir(), "mandelbrot")
+                if os.path.exists(exe_path):
+                    os.remove(exe_path)
+                    self._log("mandelbrot binário removido.", "#f9ca24")
 
         except Exception as e:
             self._log(f"Erro ao preparar compilação: {e}", "#e94560")
@@ -846,13 +888,18 @@ class Launcher:
                 f"Não foi possível ler os parâmetros da interface.\n\n{e}")
             return
 
-        if self.var_mode.get() == "wsl":
+        mode = self.var_mode.get()
+        if mode == "wsl":
             bash_cmd = self._bash_cmd(args)
             argv     = self._wsl_argv(bash_cmd)
             cwd      = None
             self._log("$ ./mandelbrot " + " ".join(args), "#45b7d1")
+        elif mode == "linux":
+            exe  = os.path.join(self._linuxdir(), "mandelbrot")
+            argv = [exe] + args
+            cwd  = self._linuxdir()
+            self._log(f"$ ./mandelbrot " + " ".join(args), "#45b7d1")
         else:
-            import os
             exe  = os.path.join(self._windir(), "main.exe")
             argv = [exe] + args
             cwd  = self._windir()
@@ -890,7 +937,8 @@ class Launcher:
                     self._log("Erro: 'wsl' não encontrado. Verifique se o WSL2 está instalado.", "#e94560")
                     self._set_status("Erro: WSL não encontrado", "#e94560")
                 else:
-                    self._log("Erro: 'main.exe' não encontrado. Verifique o caminho do projeto.", "#e94560")
+                    target_exe = "'mandelbrot'" if self.var_mode.get() == "linux" else "'main.exe'"
+                    self._log(f"Erro: {target_exe} não encontrado. Verifique o caminho do projeto.", "#e94560")
                     self._set_status("Erro: executável não encontrado", "#e94560")
             finally:
                 self._proc = None
@@ -918,7 +966,8 @@ class Launcher:
     # ── Compilar ──────────────────────────────────────────────────────────────
 
     def _compile(self, then_run=False):
-        if self.var_mode.get() == "wsl":
+        mode = self.var_mode.get()
+        if mode == "wsl":
             bash_cmd = (
                 f"cd '{self._wsldir()}' && "
                 f"rm -f mandelbrot && "
@@ -927,6 +976,10 @@ class Launcher:
             argv = self._wsl_argv(bash_cmd)
             cwd  = None
             self._log("Compilando com make (WSL)…", "#45b7d1")
+        elif mode == "linux":
+            argv = ["bash", "-c", "make 2>&1"]
+            cwd  = self._linuxdir()
+            self._log("Compilando com make (Linux nativo)…", "#45b7d1")
         else:
             argv = [
                 "g++", "main.cpp",
@@ -957,7 +1010,9 @@ class Launcher:
                     self._log(f" Falha na compilação (código {proc.returncode}).", "#e94560")
                     self._set_status("Falha na compilação", "#e94560")
             except FileNotFoundError:
-                tool = "wsl" if self.var_mode.get() == "wsl" else "g++"
+                if mode == "wsl": tool = "wsl"
+                elif mode == "linux": tool = "make"
+                else: tool = "g++"
                 self._log(f"Erro: '{tool}' não encontrado no PATH.", "#e94560")
 
         threading.Thread(target=_worker, daemon=True).start()
